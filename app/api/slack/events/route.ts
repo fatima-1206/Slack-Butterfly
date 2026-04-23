@@ -1,105 +1,110 @@
-import { NextRequest, NextResponse } from "next/server";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
-async function postSlackMessage(channel: string, text: string) {
-  const token = process.env.SLACK_BOT_TOKEN;
-  if (!token) {
-    console.error("SLACK_BOT_TOKEN is missing");
+type SlackUrlVerificationPayload = {
+  type: "url_verification";
+  challenge: string;
+};
+
+type SlackMessageEvent = {
+  type: "message";
+  channel: string;
+  channel_type?: string;
+  bot_id?: string;
+  subtype?: string;
+  user?: string;
+  text?: string;
+  ts?: string;
+};
+
+type SlackEventCallbackPayload = {
+  type: "event_callback";
+  event: SlackMessageEvent;
+};
+
+type SlackPayload = SlackUrlVerificationPayload | SlackEventCallbackPayload;
+
+const SLACK_SIGNATURE_HEADER = "x-slack-signature";
+const SLACK_TIMESTAMP_HEADER = "x-slack-request-timestamp";
+const MAX_REQUEST_AGE_SECONDS = 60 * 5;
+
+function verifySlackSignature(request: Request, rawBody: string): boolean {
+  const signingSecret = process.env.SLACK_SIGNING_SECRET;
+  if (!signingSecret) {
+    console.warn("SLACK_SIGNING_SECRET is not set, skipping verification.");
+    return true;
+  }
+  const signature = request.headers.get(SLACK_SIGNATURE_HEADER);
+  const timestamp = request.headers.get(SLACK_TIMESTAMP_HEADER);
+  if (!signature || !timestamp) return false;
+  const timestampNumber = Number(timestamp);
+  if (!Number.isFinite(timestampNumber)) return false;
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - timestampNumber) > MAX_REQUEST_AGE_SECONDS) return false;
+  const basestring = `v0:${timestamp}:${rawBody}`;
+  const expectedSignature = `v0=${createHmac("sha256", signingSecret).update(basestring).digest("hex")}`;
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expectedSignature);
+  if (signatureBuffer.length !== expectedBuffer.length) return false;
+  return timingSafeEqual(signatureBuffer, expectedBuffer);
+}
+
+async function postDmReply(channel: string, text: string): Promise<void> {
+  const botToken = process.env.SLACK_BOT_TOKEN;
+  if (!botToken) {
+    console.warn("SLACK_BOT_TOKEN is not set.");
     return;
   }
-
-  const res = await fetch("https://slack.com/api/chat.postMessage", {
+  const response = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
+      Authorization: `Bearer ${botToken}`,
+      "Content-Type": "application/json; charset=utf-8",
     },
-    body: JSON.stringify({ channel, text }),
-  });
-
-  const data = await res.json();
-  console.log("Slack response:", data);
-
-  if (!data.ok) {
-    console.error("chat.postMessage failed", {
-      error: data.error,
+    body: JSON.stringify({
       channel,
-      needed: data.needed,
-      provided: data.provided,
-    });
-  }
-}
-
-async function openDirectMessageChannel(userId: string): Promise<string | null> {
-  const token = process.env.SLACK_BOT_TOKEN;
-  if (!token) {
-    console.error("SLACK_BOT_TOKEN is missing");
-    return null;
-  }
-
-  const res = await fetch("https://slack.com/api/conversations.open", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ users: userId }),
+      text
+    }),
   });
-
-  const data = await res.json();
-  if (!data.ok) {
-    console.error("conversations.open failed", {
-      error: data.error,
-      userId,
-      needed: data.needed,
-      provided: data.provided,
-    });
-    return null;
-  }
-
-  return data.channel?.id ?? null;
+  if (!response.ok) throw new Error(`Slack HTTP error: ${response.status}`);
+  const body = (await response.json()) as { ok?: boolean; error?: string };
+  if (!body.ok) throw new Error(`Slack API error: ${body.error ?? "unknown_error"}`);
 }
 
-export async function POST(req: NextRequest) {
-  const body = await req.json();
-
-  // Slack URL verification
-  if (body.type === "url_verification") {
-    return NextResponse.json({ challenge: body.challenge });
+export async function POST(request: Request) {
+  const rawBody = await request.text();
+  if (!verifySlackSignature(request, rawBody)) {
+    return Response.json({ ok: false, error: "invalid_signature" }, { status: 401 });
   }
 
-  const event = body.event;
-
-  // Ignore bot messages (prevents loops)
-  if (!event || event.bot_id) {
-    return NextResponse.json({ ok: true });
+  let payload: SlackPayload;
+  try {
+    payload = JSON.parse(rawBody) as SlackPayload;
+  } catch {
+    return Response.json({ ok: false, error: "invalid_json" }, { status: 400 });
   }
 
-  const channel = event.channel;
-  const user = event.user;
-
-  // Ignore Slack retries to avoid duplicate responses
-  if (req.headers.get("x-slack-retry-num")) {
-    return NextResponse.json({ ok: true });
+  if (payload.type === "url_verification") {
+    return Response.json({ challenge: payload.challenge });
   }
 
-  if (!channel) {
-    return NextResponse.json({ ok: true });
+  if (payload.type === "event_callback") {
+    const { event } = payload;
+    const isUserDmMessage =
+      event.type === "message" &&
+      event.channel_type === "im" &&
+      !event.bot_id &&
+      !event.subtype &&
+      !!event.user;
+
+    if (isUserDmMessage) {
+      try {
+        // Post directly to event.channel — no conversations.open needed
+        await postDmReply(event.channel, "hello world");
+      } catch (error) {
+        console.error("Failed to send DM reply:", error);
+      }
+    }
   }
 
-  if (!user) {
-    return NextResponse.json({ ok: true });
-  }
-
-  console.log("Event received from:", user);
-  console.log("channel:", channel);
-  console.log("channel_type:", event.channel_type);
-  console.log("event_type:", event.type);
-
-  const dmChannel = await openDirectMessageChannel(user);
-  if (!dmChannel) {
-    return NextResponse.json({ ok: true });
-  }
-
-  await postSlackMessage(dmChannel, "Got your message 👀");
-  return NextResponse.json({ ok: true });
+  return Response.json({ ok: true });
 }
