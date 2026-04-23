@@ -1,4 +1,12 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { analyzeConversation, rankContacts } from "@/lib/llm";
+import {
+  getConversation,
+  createConversation,
+  addMessageToConversation,
+  resetConversation,
+} from "@/lib/conversations";
+import { getAllContacts } from "@/lib/contacts";
 
 type SlackUrlVerificationPayload = {
   type: "url_verification";
@@ -96,12 +104,108 @@ export async function POST(request: Request) {
       !event.subtype &&
       !!event.user;
 
-    if (isUserDmMessage) {
+    if (isUserDmMessage && event.text && event.user && event.channel) {
+      const userId = event.user;
+      const userMessage = event.text.trim();
+      const channelId = event.channel;
+
       try {
-        // Post directly to event.channel — no conversations.open needed
-        await postDmReply(event.channel, "hello world");
+        // Handle special commands
+        if (userMessage.toLowerCase() === "reset") {
+          await resetConversation(userId);
+          await postDmReply(
+            channelId,
+            "Conversation reset. Tell me about a problem you need help solving."
+          );
+          return Response.json({ ok: true });
+        }
+
+        // Get or create conversation
+        let conversation = await getConversation(userId);
+        if (!conversation) {
+          conversation = await createConversation(userId);
+        }
+
+        // Convert conversation history to LLM format
+        const llmHistory = conversation.messages.map((m) => ({
+          role: m.role as "user" | "assistant",
+          content: m.content,
+        }));
+
+        // Analyze the message with LLM
+        const analysis = await analyzeConversation(userMessage, llmHistory);
+
+        // Determine the response
+        let botResponse: string;
+
+        if (analysis.nextAction === "ready_to_recommend") {
+          // We have enough info to recommend contacts
+          const allContacts = getAllContacts();
+          const recommendations = await rankContacts(analysis.updatedState, allContacts);
+
+          if (recommendations.length === 0) {
+            botResponse =
+              "I couldn't find good matches in the contact list. Can you tell me more about what you're looking for?";
+          } else {
+            // Format recommendations with Block Kit-friendly text
+            const recommendationText = recommendations
+              .map(
+                (rec, idx) =>
+                  `${idx + 1}. *${rec.contactId}* - ${rec.why}\n   Score: ${(rec.score * 100).toFixed(0)}%`
+              )
+              .join("\n\n");
+
+            botResponse = `Great! I found ${recommendations.length} people who might help:\n\n${recommendationText}\n\nWould any of these be useful? You can tell me to reach out to someone, or I can search for others.`;
+          }
+
+          // Update conversation to recommending state
+          await addMessageToConversation(
+            userId,
+            { role: "user", content: userMessage },
+            analysis.updatedState,
+            analysis.confidence,
+            "recommending"
+          );
+        } else {
+          // Need more clarification
+          const clarificationText = analysis.clarificationQuestions
+            .slice(0, 2) // Limit to 2 questions for brevity
+            .join("\n\n");
+
+          botResponse = clarificationText ||
+            "Can you tell me more about what you need help with?";
+
+          // Update conversation with clarification state
+          await addMessageToConversation(
+            userId,
+            { role: "user", content: userMessage },
+            analysis.updatedState,
+            analysis.confidence,
+            "clarifying"
+          );
+        }
+
+        // Add bot response to conversation
+        await addMessageToConversation(
+          userId,
+          { role: "assistant", content: botResponse },
+          analysis.updatedState,
+          analysis.confidence,
+          analysis.nextAction === "ready_to_recommend" ? "recommending" : "clarifying"
+        );
+
+        // Send response to user
+        await postDmReply(channelId, botResponse);
       } catch (error) {
-        console.error("Failed to send DM reply:", error);
+        console.error("Error processing message:", error);
+        try {
+          await postDmReply(
+            channelId,
+            "Sorry, something went wrong. Please try again or type 'reset' to start over."
+          );
+        } catch (sendError) {
+          console.error("Failed to send error message:", sendError);
+        }
       }
     }
   }
