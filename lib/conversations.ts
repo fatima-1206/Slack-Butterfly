@@ -2,15 +2,7 @@
  * Conversation state management using Firebase
  */
 
-import {
-  doc,
-  getDoc,
-  setDoc,
-  updateDoc,
-  Timestamp,
-  serverTimestamp,
-} from "firebase/firestore";
-import { db } from "./firebase";
+import { getFirestore } from "./firebase";
 
 export interface Message {
   role: "user" | "assistant";
@@ -41,10 +33,10 @@ const CONVERSATIONS_COLLECTION = "conversations";
 
 export async function getConversation(userId: string): Promise<ConversationRecord | null> {
   try {
-    const docRef = doc(db, CONVERSATIONS_COLLECTION, userId);
-    const docSnap = await getDoc(docRef);
+    const db = getFirestore();
+    const docSnap = await db.collection(CONVERSATIONS_COLLECTION).doc(userId).get();
 
-    if (!docSnap.exists()) {
+    if (!docSnap.exists) {
       return null;
     }
 
@@ -65,13 +57,13 @@ export async function createConversation(userId: string): Promise<ConversationRe
     },
     state: "clarifying",
     confidence: 0,
-    lastUpdated: serverTimestamp(),
+    lastUpdated: new Date(),
     version: 1,
   };
 
   try {
-    const docRef = doc(db, CONVERSATIONS_COLLECTION, userId);
-    await setDoc(docRef, newConversation);
+    const db = getFirestore();
+    await db.collection(CONVERSATIONS_COLLECTION).doc(userId).set(newConversation);
     return newConversation;
   } catch (error) {
     console.error(`Failed to create conversation for user ${userId}:`, error);
@@ -87,20 +79,23 @@ export async function addMessageToConversation(
   newState: "clarifying" | "ready_to_recommend" | "recommending"
 ): Promise<ConversationRecord> {
   try {
-    const docRef = doc(db, CONVERSATIONS_COLLECTION, userId);
+    const db = getFirestore();
+    const docRef = db.collection(CONVERSATIONS_COLLECTION).doc(userId);
+    const currentDoc = await docRef.get();
+    const currentData = currentDoc.data() as ConversationRecord | undefined;
 
     const messageWithTimestamp: Message = {
       ...message,
       timestamp: Date.now(),
     };
 
-    await updateDoc(docRef, {
-      messages: (await getDoc(docRef)).data()?.messages?.concat(messageWithTimestamp) || [messageWithTimestamp],
+    await docRef.update({
+      messages: (currentData?.messages || []).concat(messageWithTimestamp),
       problemState,
       state: newState,
       confidence,
-      lastUpdated: serverTimestamp(),
-      version: ((await getDoc(docRef)).data()?.version || 0) + 1,
+      lastUpdated: new Date(),
+      version: ((currentData?.version || 0) + 1),
     });
 
     const updated = await getConversation(userId);
@@ -122,12 +117,12 @@ export async function resetConversation(userId: string): Promise<ConversationRec
       },
       state: "clarifying",
       confidence: 0,
-      lastUpdated: serverTimestamp(),
+      lastUpdated: new Date(),
       version: 1,
     };
 
-    const docRef = doc(db, CONVERSATIONS_COLLECTION, userId);
-    await setDoc(docRef, newConversation, { merge: false });
+    const db = getFirestore();
+    await db.collection(CONVERSATIONS_COLLECTION).doc(userId).set(newConversation);
     return newConversation;
   } catch (error) {
     console.error(`Failed to reset conversation for user ${userId}:`, error);

@@ -1,21 +1,50 @@
-// Import the functions you need from the SDKs you need
-import { getApps, initializeApp } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
+import * as admin from "firebase-admin";
 
+let app: admin.app.App | null = null;
+let db: FirebaseFirestore.Firestore | null = null;
 
-// Your web app's Firebase configuration from environment variables
-const firebaseConfig = {
-  apiKey: process.env.FIREBASE_API_KEY!,
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN!,
-  projectId: process.env.FIREBASE_PROJECT_ID!,
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET!,
-  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID!,
-  appId: process.env.FIREBASE_APP_ID!,
-};
+function ensureFirebaseInitialized() {
+  if (db) {
+    return db;
+  }
 
-// prevents re-initializing on hot reloads
-const app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
+  const serviceAccountKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
 
-export const db = getFirestore(app);
+  if (!serviceAccountKey) {
+    throw new Error(
+      "FIREBASE_SERVICE_ACCOUNT_KEY environment variable is not set. " +
+        "See FIREBASE_SETUP.md for setup instructions."
+    );
+  }
+
+  try {
+    // Parse service account key (support both base64 and JSON)
+    let serviceAccount;
+    try {
+      serviceAccount = JSON.parse(Buffer.from(serviceAccountKey, "base64").toString("utf-8"));
+    } catch {
+      serviceAccount = JSON.parse(serviceAccountKey);
+    }
+
+    // Initialize Firebase Admin
+    if (admin.apps.length === 0) {
+      app = admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        projectId: serviceAccount.project_id,
+      });
+    } else {
+      app = admin.app();
+    }
+
+    db = admin.firestore(app);
+    return db;
+  } catch (error) {
+    console.error("Failed to initialize Firebase:", error);
+    throw error;
+  }
+}
+
+// Export getter function for lazy initialization
+export function getFirestore(): FirebaseFirestore.Firestore {
+  return ensureFirebaseInitialized();
+}
