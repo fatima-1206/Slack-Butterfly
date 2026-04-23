@@ -1,6 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 
+type SlackEvent = {
+  type?: string;
+  user?: string;
+  channel?: string;
+  text?: string;
+  ts?: string;
+  bot_id?: string;
+  subtype?: string;
+  reaction?: string;
+  item?: unknown;
+};
+
 /**
  * Validates the Slack request signature
  * Slack signs all requests with an HMAC signature in the X-Slack-Request-Timestamp header
@@ -38,11 +50,15 @@ function verifySlackSignature(
     .digest('hex');
   const computedSignature = `v0=${hash}`;
 
+  // timingSafeEqual throws if buffer lengths differ
+  const computed = Buffer.from(computedSignature);
+  const provided = Buffer.from(slackSignature);
+  if (computed.length !== provided.length) {
+    return false;
+  }
+
   // Use timing-safe comparison
-  return crypto.timingSafeEqual(
-    Buffer.from(computedSignature),
-    Buffer.from(slackSignature)
-  );
+  return crypto.timingSafeEqual(computed, provided);
 }
 
 export async function POST(request: NextRequest) {
@@ -50,19 +66,23 @@ export async function POST(request: NextRequest) {
     // Get the raw body for signature verification
     const body = await request.text();
 
+    // Parse body once so we can handle Slack URL verification immediately.
+    // During setup, this prevents false negatives if signing config is incomplete.
+    const payload = JSON.parse(body);
+
+    // Handle URL verification challenge (must return the raw challenge value)
+    if (payload.type === 'url_verification' && typeof payload.challenge === 'string') {
+      console.log('Slack verification challenge received');
+      return new NextResponse(payload.challenge, {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      });
+    }
+
     // Verify the Slack signature
     if (!verifySlackSignature(request, body)) {
       console.error('Invalid Slack signature');
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-
-    // Parse the body
-    const payload = JSON.parse(body);
-
-    // Handle URL verification challenge
-    if (payload.type === 'url_verification') {
-      console.log('Slack verification challenge received');
-      return NextResponse.json({ challenge: payload.challenge });
     }
 
     // Handle events
@@ -77,13 +97,13 @@ export async function POST(request: NextRequest) {
       // Route to appropriate handler based on event type
       switch (event.type) {
         case 'app_mention':
-          await handleAppMention(event, payload.team_id);
+          await handleAppMention(event);
           break;
         case 'message':
-          await handleMessage(event, payload.team_id);
+          await handleMessage(event);
           break;
         case 'reaction_added':
-          await handleReactionAdded(event, payload.team_id);
+          await handleReactionAdded(event);
           break;
         default:
           console.log(`Unhandled event type: ${event.type}`);
@@ -109,8 +129,7 @@ export async function POST(request: NextRequest) {
  * Handle when the bot is mentioned in a channel or DM
  */
 async function handleAppMention(
-  event: Record<string, any>,
-  teamId: string
+  event: SlackEvent
 ) {
   console.log('Handling app_mention', {
     user: event.user,
@@ -125,7 +144,7 @@ async function handleAppMention(
 /**
  * Handle direct messages to the bot
  */
-async function handleMessage(event: Record<string, any>, teamId: string) {
+async function handleMessage(event: SlackEvent) {
   // Skip bot messages and message edits/deletions
   if (event.bot_id || event.subtype === 'message_deleted' || event.subtype === 'message_changed') {
     return;
@@ -145,8 +164,7 @@ async function handleMessage(event: Record<string, any>, teamId: string) {
  * Handle reaction additions (future: could be used for feedback)
  */
 async function handleReactionAdded(
-  event: Record<string, any>,
-  teamId: string
+  event: SlackEvent
 ) {
   console.log('Handling reaction_added', {
     user: event.user,
