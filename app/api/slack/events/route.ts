@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { analyzeConversation, rankContacts } from "@/lib/llm";
+import { analyzeConversation, analyzeRecommendationFeedback, rankContacts } from "@/lib/llm";
 import {
   getConversation,
   createConversation,
@@ -204,8 +204,12 @@ async function processUserMessage(userId: string, userMessage: string, channelId
     }));
 
     console.log(`[Process] Analyzing message with LLM (history length: ${llmHistory.length})`);
-    // Analyze the message with LLM
-    const analysis = await analyzeConversation(userMessage, llmHistory);
+
+    const isRecommendationFollowUp = conversation.state === "recommending";
+    const analysis = isRecommendationFollowUp
+      ? await analyzeRecommendationFeedback(userMessage, conversation.problemState, llmHistory)
+      : await analyzeConversation(userMessage, llmHistory);
+
     console.log(
       `[Process] LLM analysis: nextAction=${analysis.nextAction}, confidence=${analysis.confidence}, missingFields=${analysis.missingFields.join(", ")}`
     );
@@ -213,21 +217,30 @@ async function processUserMessage(userId: string, userMessage: string, channelId
     // Determine the response
     let botResponse: string;
 
-    if (analysis.nextAction === "ready_to_recommend") {
-      console.log(`[Process] Entering recommendation mode`);
+    if (analysis.nextAction === "ready_to_recommend" || analysis.nextAction === "refine") {
+      console.log(`[Process] Entering recommendation mode${analysis.nextAction === "refine" ? " (refinement)" : ""}`);
       // We have enough info to recommend contacts
       console.log(`[Process] Fetching contacts from Slack`);
       const allContacts = await getAllContacts();
       console.log(`[Process] Fetched ${allContacts.length} contacts`);
       const contactsById = new Map(allContacts.map((c) => [c.id, c]));
 
-      console.log(`[Process] Ranking contacts for problem state: ${JSON.stringify(analysis.updatedState).substring(0, 100)}`);
-      const recommendations = await rankContacts(analysis.updatedState, allContacts);
+      console.log(
+        `[Process] Ranking contacts for problem state: ${JSON.stringify(analysis.updatedState).substring(0, 100)}`
+      );
+      const recommendations = await rankContacts(
+        analysis.updatedState,
+        allContacts,
+        analysis.refinement
+      );
       console.log(`[Process] Got ${recommendations.length} recommendations`);
 
       if (recommendations.length === 0) {
-        botResponse =
-          "I couldn't find strong matches in the current contact list yet. If you want, I can broaden the search (for example: product designers, UX/UI, or visual branding).";
+        const refinementText = analysis.refinement?.preferredDirections?.length
+          ? `I tuned the search toward ${analysis.refinement.preferredDirections.join(", ")}, but still couldn't find strong matches in the current contact list yet.`
+          : "I couldn't find strong matches in the current contact list yet.";
+
+        botResponse = `${refinementText} If you want, give me one more direction to bias toward and I’ll try again.`;
       } else {
         // Format recommendations with Block Kit-friendly text
         const recommendationText = recommendations
@@ -239,7 +252,12 @@ async function processUserMessage(userId: string, userMessage: string, channelId
           })
           .join("\n\n");
 
-        botResponse = `Great! I found ${recommendations.length} people who might help:\n\n${recommendationText}\n\nWould any of these be useful? You can tell me to reach out to someone, or I can search for others.`;
+        const refinementHint =
+          analysis.nextAction === "refine" && analysis.refinement?.preferredDirections?.length
+            ? `\n\nI biased this round toward ${analysis.refinement.preferredDirections.join(", ")}.`
+            : "";
+
+        botResponse = `Great! I found ${recommendations.length} people who might help:\n\n${recommendationText}${refinementHint}\n\nIf this is close but not quite right, tell me what to shift toward and I’ll rerank.`;
       }
 
       console.log(`[Process] Updating conversation to recommending state`);
@@ -280,7 +298,9 @@ async function processUserMessage(userId: string, userMessage: string, channelId
       { role: "assistant", content: botResponse },
       analysis.updatedState,
       analysis.confidence,
-      analysis.nextAction === "ready_to_recommend" ? "recommending" : "clarifying"
+      analysis.nextAction === "ready_to_recommend" || analysis.nextAction === "refine"
+        ? "recommending"
+        : "clarifying"
     );
 
     console.log(`[Process] Sending response to Slack (length: ${botResponse.length})`);

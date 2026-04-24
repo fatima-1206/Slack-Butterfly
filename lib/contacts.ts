@@ -297,6 +297,38 @@ async function loadContactsFromFirestore(): Promise<Contact[] | null> {
   }
 }
 
+/**
+ * Load only enrichment metadata from Firestore (enrichedAt, skills, summary, etc.)
+ * without filtering by freshness, so we can reuse enrichment data across cache cycles
+ */
+async function loadEnrichmentMetadataFromFirestore(): Promise<Map<string, Partial<Contact>>> {
+  try {
+    const db = getFirestore();
+    const snapshot = await db.collection(CONTACTS_COLLECTION).get();
+    if (snapshot.empty) return new Map();
+
+    const enrichmentMap = new Map<string, Partial<Contact>>();
+
+    snapshot.docs
+      .filter((d) => d.id !== "_meta")
+      .forEach((doc) => {
+        const data = doc.data() as Contact;
+        enrichmentMap.set(data.id, {
+          skills: data.skills,
+          summary: data.summary,
+          experience: data.experience,
+          enrichedAt: data.enrichedAt,
+          enrichmentAttempts: data.enrichmentAttempts,
+        });
+      });
+
+    return enrichmentMap;
+  } catch (error) {
+    console.error("Failed to load enrichment metadata from Firestore:", error);
+    return new Map();
+  }
+}
+
 async function saveContactsToFirestore(contacts: Contact[]): Promise<void> {
   try {
     const db = getFirestore();
@@ -356,11 +388,19 @@ export async function getAllContacts(): Promise<Contact[]> {
       `[Contacts] Slack users total=${slackUsers.length}, active=${activeUsers.length}, filteredOut=${filteredOut}`
     );
 
+    // Load existing enrichment metadata from Firestore before creating fresh contacts
+    const enrichmentMetadata = await loadEnrichmentMetadataFromFirestore();
+
     let contacts: Contact[] = activeUsers
-      .map((user) => ({
-        ...transformSlackUserToContact(user),
-        lastUpdated: Date.now(),
-      } as Contact))
+      .map((user) => {
+        const baseContact = transformSlackUserToContact(user);
+        const enrichedMeta = enrichmentMetadata.get(user.id);
+        return {
+          ...baseContact,
+          ...enrichedMeta,
+          lastUpdated: Date.now(),
+        } as Contact;
+      })
       .filter((contact) => !isSystemContact(contact));
 
     // Enrich contacts with Tavily (async, non-blocking for cache)
