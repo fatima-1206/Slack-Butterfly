@@ -248,7 +248,8 @@ async function processUserMessage(userId: string, userMessage: string, channelId
             const contact = contactsById.get(rec.contactId);
             const displayName = contact?.name || rec.contactId;
             const displayTitle = contact?.title ? ` (${contact.title})` : "";
-            return `${idx + 1}. *${displayName}*${displayTitle} - ${rec.why}\n   Score: ${(rec.score * 100).toFixed(0)}%`;
+            const askLine = rec.suggestedAsk ? `\n   Ask them: "${rec.suggestedAsk}"` : "";
+            return `${idx + 1}. *${displayName}*${displayTitle} - ${rec.why}\n   Score: ${(rec.score * 100).toFixed(0)}%${askLine}`;
           })
           .join("\n\n");
 

@@ -43,6 +43,7 @@ type RankedContactRecord = {
   why: string;
   strengthsMatched: string[];
   uncertainty: string[];
+  suggestedAsk?: string;
 };
 
 export type ConversationAnalysis = {
@@ -672,6 +673,7 @@ For each candidate, provide a JSON object with:
 - why: 1-2 sentence explanation
 - strengthsMatched: array of specific strengths that match the problem
 - uncertainty: array of factors that make you uncertain (missing info, potential mismatches)
+- suggestedAsk: a specific question you should ask them about your problem (e.g., "Can you share your experience with llama models in production?")
 
 Scoring rules:
 - Use low scores (0.0-0.35) when evidence is weak or missing.
@@ -685,7 +687,8 @@ Respond with ONLY a JSON array, no markdown:
     "score": 0.0-1.0,
     "why": "string",
     "strengthsMatched": ["string"],
-    "uncertainty": ["string"]
+    "uncertainty": ["string"],
+    "suggestedAsk": "string"
   }
 ]`;
 
@@ -712,7 +715,8 @@ Respond with ONLY a JSON array, no markdown:
           Number.isFinite(record.score) &&
           typeof record.why === "string" &&
           Array.isArray(record.strengthsMatched) &&
-          Array.isArray(record.uncertainty)
+          Array.isArray(record.uncertainty) &&
+          (typeof record.suggestedAsk === "string" || record.suggestedAsk === undefined)
       )
       .map((rec) => {
         const contact = filteredContacts.find((item) => item.id === rec.contactId);
@@ -790,6 +794,7 @@ Respond with ONLY a JSON array, no markdown:
           (signal) => buildContactSignalText(contact).includes(signal.toLowerCase())
         ),
         uncertainty: ["Model parsing failed, so this ranking is heuristic only."],
+        suggestedAsk: `Can you share your experience with ${problemState.keyNeeds.slice(0, 2).join(" and ")}?`,
       }))
       .filter((candidate) => candidate.score >= 0.20)
       .sort((a, b) => b.score - a.score)
