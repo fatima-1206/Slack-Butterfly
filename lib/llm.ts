@@ -740,14 +740,44 @@ Respond with ONLY a JSON array, no markdown:
         };
       });
 
-    // Sort by score descending, drop very weak matches (< 0.15), and return top 5.
-    // For small contact pools, we're lenient and show weak matches too.
-    const filtered = scored.filter((record) => record.score >= 0.15);
-    console.log("[Ranking] After filtering (>= 0.15):", filtered.length, "candidates remaining");
-    const sorted = filtered.sort((a, b) => b.score - a.score);
-    const result = sorted.slice(0, 5);
-    console.log("[Ranking] Top 5 results:", result.map((r) => ({ contactId: r.contactId, score: r.score })));
-    return result;
+    // Sort by score descending
+    const sorted = scored.sort((a, b) => b.score - a.score);
+    
+    // Apply smart filtering:
+    // 1. Always require score >= 0.40 at minimum
+    // 2. If top candidate is good (>= 0.55), be stricter with others (require 0.40)
+    // 3. If top candidate is weak, require at least 0.30
+    // 4. Look for big gaps in scores and stop there
+    
+    const topScore = sorted[0]?.score || 0;
+    const minScoreThreshold = topScore >= 0.55 ? 0.40 : 0.35;
+    
+    const filtered: RankedContactRecord[] = [];
+    for (let i = 0; i < sorted.length && filtered.length < 5; i++) {
+      const candidate = sorted[i];
+      
+      // Skip if below minimum threshold
+      if (candidate.score < minScoreThreshold) {
+        console.log("[Ranking] Skipping", candidate.contactId, "score", candidate.score, "< min", minScoreThreshold);
+        break;
+      }
+      
+      // Check for significant score gap (drop of > 0.25 between consecutive candidates)
+      if (filtered.length > 0) {
+        const prev = filtered[filtered.length - 1];
+        const gap = prev.score - candidate.score;
+        if (gap > 0.25 && candidate.score < 0.50) {
+          console.log("[Ranking] Breaking at gap:", gap.toFixed(2), "between score", prev.score.toFixed(2), "and", candidate.score.toFixed(2));
+          break;
+        }
+      }
+      
+      filtered.push(candidate);
+    }
+    
+    console.log("[Ranking] After smart filtering:", filtered.length, "candidates remaining");
+    console.log("[Ranking] Results:", filtered.map((r) => ({ contactId: r.contactId, score: (r.score * 100).toFixed(1) + "%" })));
+    return filtered;
   } catch (error) {
     console.error("[Ranking] Failed to parse ranking response:", rankResponse.content, error);
     console.log("[Ranking] Falling back to heuristic scoring for", filteredContacts.length, "contacts");
