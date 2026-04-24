@@ -590,3 +590,71 @@ function extractSkillsFromProfile(
 
   return skills.length > 0 ? skills : undefined;
 }
+
+/**
+ * Validate a contact to ensure it matches the intended person
+ * Checks for consistency between title, skills, and enriched data
+ */
+export function validateContact(contact: Contact, requiredSkills: string[]): {
+  isValid: boolean;
+  confidence: number;
+  issues: string[];
+} {
+  const issues: string[] = [];
+  let confidence = 1.0;
+
+  // Check if title contains relevant keywords
+  const titleLower = contact.title.toLowerCase();
+  const hasRelevantTitle = requiredSkills.some((skill) =>
+    titleLower.includes(skill.toLowerCase())
+  );
+
+  if (!hasRelevantTitle && requiredSkills.length > 0) {
+    issues.push(`Title "${contact.title}" doesn't contain expected skills`);
+    confidence -= 0.15;
+  }
+
+  // Check if skills align with required skills
+  if (contact.skills && contact.skills.length > 0 && requiredSkills.length > 0) {
+    const matchedSkills = requiredSkills.filter((req) =>
+      contact.skills?.some(
+        (s) =>
+          s.toLowerCase().includes(req.toLowerCase()) ||
+          req.toLowerCase().includes(s.toLowerCase())
+      )
+    );
+
+    if (matchedSkills.length === 0) {
+      issues.push(`No skills match: required ${requiredSkills.join(", ")}, found ${contact.skills.join(", ")}`);
+      confidence -= 0.25;
+    } else if (matchedSkills.length < requiredSkills.length * 0.5) {
+      issues.push(`Weak skill match: only ${matchedSkills.length}/${requiredSkills.length} skills align`);
+      confidence -= 0.1;
+    }
+  }
+
+  // Check if summary/experience contains relevant keywords
+  if (contact.summary || contact.experience) {
+    const combinedText = `${contact.summary || ""} ${contact.experience || ""}`.toLowerCase();
+    const hasRelevantContext = requiredSkills.some((skill) =>
+      combinedText.includes(skill.toLowerCase())
+    );
+
+    if (!hasRelevantContext && requiredSkills.length > 0) {
+      issues.push("Summary/experience doesn't mention required skills");
+      confidence -= 0.1;
+    }
+  } else {
+    // No enriched data adds some uncertainty
+    confidence -= 0.05;
+  }
+
+  // Contact is valid if confidence >= 0.35 (weak but acceptable)
+  const isValid = confidence >= 0.35;
+
+  return {
+    isValid,
+    confidence: Math.max(0, confidence),
+    issues,
+  };
+}

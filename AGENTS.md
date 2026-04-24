@@ -95,17 +95,6 @@ Your bot gives recommendations then stops. Users can't:
    messages: admin.firestore.FieldValue.arrayUnion(messageWithTimestamp)
    ```
 
-4. **Update Slack Manifest** (10 min)
-   - Change webhook URL to Vercel endpoint
-   - Optionally add `users:read.email` scope
-
-### **Phase 2: Implement Feedback Loop (2–3 hours)** — THIS IS THE BIG ONE
-
-1. Parse user feedback: "show more X", "not relevant", "needs Y"
-2. Store feedback in Firestore (new collection or sub-doc)
-3. Update problem state based on feedback
-4. Re-rank contacts with refined criteria
-5. Invite feedback in bot responses ("Tell me if this isn't right or if you want different skills")
 
 ### **Phase 3: Robustness (2–3 hours)**
 
