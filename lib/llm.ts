@@ -2,6 +2,9 @@
  * LLM client that handles both development (Groq) and production (GitHub GPT-4) models
  */
 
+import OpenAI from "openai";
+import { Groq } from "groq-sdk";
+
 type LLMProvider = "groq" | "github";
 
 interface LLMMessage {
@@ -25,19 +28,20 @@ function getLLMConfig() {
   const provider = getLLMProvider();
 
   if (provider === "github") {
+    console.log("Using GitHub GPT-4 model for LLM interactions");
     return {
       provider: "github" as const,
       model: process.env.PRODUCTION_MODEL || "openai/gpt-4o",
       token: process.env.PRODUCTION_MODEL_TOKEN,
-      baseUrl: "https://models.inference.ai.azure.com",
+      endpoint: "https://models.github.ai/inference",
     };
   }
 
+  console.log("Using Groq model for LLM interactions");
   return {
     provider: "groq" as const,
-    model: process.env.DEVELOPMENT_MODEL || "meta-llama/llama-3.3-70b-versatile",
+    model: process.env.DEVELOPMENT_MODEL || "llama-3.3-70b-versatile",
     token: process.env.DEVELOPMENT_MODEL_TOKEN,
-    baseUrl: "https://api.groq.com/openai/v1",
   };
 }
 
@@ -48,45 +52,59 @@ export async function callLLM(messages: LLMMessage[], temperature = 0.7): Promis
     throw new Error(`${config.provider.toUpperCase()} API token not configured`);
   }
 
-  const response = await fetch(`${config.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.token}`,
-    },
-    body: JSON.stringify({
+  if (config.provider === "github") {
+    const client = new OpenAI({
+      baseURL: config.endpoint,
+      apiKey: config.token,
+    });
+
+    const response = await client.chat.completions.create({
       model: config.model,
-      messages,
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
       temperature,
       max_tokens: 1024,
-    }),
-  });
+    });
 
-  if (!response.ok) {
-    const error = await response.text();
-    console.error(`LLM API error: ${response.status}`, error);
-    throw new Error(`LLM API error: ${response.status}`);
-  }
+    const content = response.choices[0]?.message?.content || "";
 
-  const data = (await response.json()) as {
-    choices: Array<{ message: { content: string } }>;
-    usage?: {
-      prompt_tokens: number;
-      completion_tokens: number;
+    return {
+      content,
+      usage: response.usage
+        ? {
+            promptTokens: response.usage.prompt_tokens,
+            completionTokens: response.usage.completion_tokens,
+          }
+        : undefined,
     };
-  };
+  } else {
+    // Groq provider
+    const client = new Groq({ apiKey: config.token });
 
-  const content = data.choices[0]?.message?.content || "";
+    const response = await client.chat.completions.create({
+      model: config.model,
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+      temperature,
+      max_tokens: 1024,
+    });
 
-  return {
-    content,
-    usage: data.usage
-      ? {
-          promptTokens: data.usage.prompt_tokens,
-          completionTokens: data.usage.completion_tokens,
-        }
-      : undefined,
-  };
+    const content = response.choices[0]?.message?.content || "";
+
+    return {
+      content,
+      usage: response.usage
+        ? {
+            promptTokens: response.usage.prompt_tokens,
+            completionTokens: response.usage.completion_tokens,
+          }
+        : undefined,
+    };
+  }
 }
 
 export async function analyzeConversation(
@@ -108,21 +126,24 @@ export async function analyzeConversation(
 }> {
   const systemPrompt = `You are an expert at understanding problems and identifying which people in a network could help solve them.
 
-Analyze the user's message and conversation history to extract a structured problem state. Determine:
-1. What type of problem this is (technical, organizational, research, career, etc.)
-2. A clear summary of the problem
-3. Key needs or skills required
-4. Constraints (timeline, resources, etc.)
-5. Urgency level
-6. Domain (backend, frontend, ML, design, etc.)
+Analyze the user's message and conversation history to extract a structured problem state.
 
-Required fields: problemType, summary, keyNeeds
-Optional fields: constraints, urgency, domain
+REQUIRED fields:
+- problemType
+- summary
+- keyNeeds
 
-After analysis, determine:
-- Which fields are missing
-- What clarifying questions would help (if any)
-- Your confidence level (0-1) that you understand the problem enough to find relevant people
+OPTIONAL fields:
+- constraints
+- urgency
+- domain
+
+Rules:
+- Only include REQUIRED fields in missingFields.
+- Do not ask clarifying questions about OPTIONAL fields unless the user explicitly asks for that depth.
+- Ask at most 2 clarification questions.
+- If required fields are reasonably inferred, return confidence >= 0.7.
+- Prefer moving forward to recommendations over over-questioning.
 
 Respond with ONLY valid JSON, no markdown or extra text:
 {
@@ -134,7 +155,7 @@ Respond with ONLY valid JSON, no markdown or extra text:
     "urgency": "low|medium|high or null",
     "domain": "string or null"
   },
-  "missingFields": ["string"],
+  "missingFields": ["problemType|summary|keyNeeds"],
   "clarificationQuestions": ["string"],
   "confidence": 0.0-1.0,
   "reasoning": "brief explanation"
@@ -153,13 +174,28 @@ Respond with ONLY valid JSON, no markdown or extra text:
     const jsonMatch = response.content.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(jsonMatch?.[0] || response.content);
 
+    const updatedState = parsed.updatedState || {};
+    const requiredMissing = ["problemType", "summary", "keyNeeds"].filter((field) => {
+      if (field === "keyNeeds") {
+        return !Array.isArray(updatedState.keyNeeds) || updatedState.keyNeeds.length === 0;
+      }
+
+      return !updatedState[field] || String(updatedState[field]).trim().length === 0;
+    });
+
+    const clarificationQuestions = Array.isArray(parsed.clarificationQuestions)
+      ? parsed.clarificationQuestions.slice(0, 2)
+      : [];
+
+    const confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0.5;
+
     return {
-      updatedState: parsed.updatedState,
-      missingFields: parsed.missingFields || [],
-      clarificationQuestions: parsed.clarificationQuestions || [],
-      confidence: parsed.confidence || 0.5,
+      updatedState,
+      missingFields: requiredMissing,
+      clarificationQuestions,
+      confidence,
       nextAction:
-        parsed.confidence > 0.75 && parsed.missingFields.length === 0
+        requiredMissing.length === 0 && confidence >= 0.6
           ? "ready_to_recommend"
           : "clarify",
     };
@@ -259,6 +295,11 @@ For each candidate, provide a JSON object with:
 - strengthsMatched: array of specific strengths that match the problem
 - uncertainty: array of factors that make you uncertain (missing info, potential mismatches)
 
+Scoring rules:
+- Use low scores (0.0-0.35) when evidence is weak or missing.
+- Only use score >= 0.6 when there is clear evidence from title/skills/summary.
+- If no candidate is a strong fit, you may return an empty array.
+
 Respond with ONLY a JSON array, no markdown:
 [
   {
@@ -279,8 +320,12 @@ Respond with ONLY a JSON array, no markdown:
     const jsonMatch = rankResponse.content.match(/\[[\s\S]*\]/);
     const parsed = JSON.parse(jsonMatch?.[0] || rankResponse.content);
 
-    // Sort by score descending and return top 5
+    // Sort by score descending, drop weak matches, and return top 5.
     return parsed
+      .filter(
+        (r: { score?: number; contactId?: string }) =>
+          typeof r.score === "number" && Number.isFinite(r.score) && r.score >= 0.35 && !!r.contactId
+      )
       .sort((a: { score: number }, b: { score: number }) => b.score - a.score)
       .slice(0, 5);
   } catch (error) {

@@ -219,6 +219,7 @@ async function processUserMessage(userId: string, userMessage: string, channelId
       console.log(`[Process] Fetching contacts from Slack`);
       const allContacts = await getAllContacts();
       console.log(`[Process] Fetched ${allContacts.length} contacts`);
+      const contactsById = new Map(allContacts.map((c) => [c.id, c]));
 
       console.log(`[Process] Ranking contacts for problem state: ${JSON.stringify(analysis.updatedState).substring(0, 100)}`);
       const recommendations = await rankContacts(analysis.updatedState, allContacts);
@@ -226,14 +227,16 @@ async function processUserMessage(userId: string, userMessage: string, channelId
 
       if (recommendations.length === 0) {
         botResponse =
-          "I couldn't find good matches in the contact list. Can you tell me more about what you're looking for?";
+          "I couldn't find strong matches in the current contact list yet. If you want, I can broaden the search (for example: product designers, UX/UI, or visual branding).";
       } else {
         // Format recommendations with Block Kit-friendly text
         const recommendationText = recommendations
-          .map(
-            (rec, idx) =>
-              `${idx + 1}. *${rec.contactId}* - ${rec.why}\n   Score: ${(rec.score * 100).toFixed(0)}%`
-          )
+          .map((rec, idx) => {
+            const contact = contactsById.get(rec.contactId);
+            const displayName = contact?.name || rec.contactId;
+            const displayTitle = contact?.title ? ` (${contact.title})` : "";
+            return `${idx + 1}. *${displayName}*${displayTitle} - ${rec.why}\n   Score: ${(rec.score * 100).toFixed(0)}%`;
+          })
           .join("\n\n");
 
         botResponse = `Great! I found ${recommendations.length} people who might help:\n\n${recommendationText}\n\nWould any of these be useful? You can tell me to reach out to someone, or I can search for others.`;
