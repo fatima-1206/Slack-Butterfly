@@ -1,5 +1,6 @@
 /**
  * Conversation state management using Firebase
+ * Scoped by workspace to support multi-workspace deployments
  */
 
 import { getFirestore } from "./firebase";
@@ -20,21 +21,27 @@ export interface ProblemState {
 }
 
 export interface ConversationRecord {
+  workspaceId: string;
   userId: string;
   messages: Message[];
   problemState: ProblemState;
   state: "clarifying" | "ready_to_recommend" | "recommending";
   confidence: number;
-  lastUpdated: any;
+  lastUpdated: Date;
   version: number;
 }
 
 const CONVERSATIONS_COLLECTION = "conversations";
 
-export async function getConversation(userId: string): Promise<ConversationRecord | null> {
+export async function getConversation(workspaceId: string, userId: string): Promise<ConversationRecord | null> {
   try {
     const db = getFirestore();
-    const docSnap = await db.collection(CONVERSATIONS_COLLECTION).doc(userId).get();
+    const docSnap = await db
+      .collection(CONVERSATIONS_COLLECTION)
+      .doc(workspaceId)
+      .collection("users")
+      .doc(userId)
+      .get();
 
     if (!docSnap.exists) {
       return null;
@@ -42,13 +49,14 @@ export async function getConversation(userId: string): Promise<ConversationRecor
 
     return docSnap.data() as ConversationRecord;
   } catch (error) {
-    console.error(`Failed to get conversation for user ${userId}:`, error);
+    console.error(`Failed to get conversation for workspace ${workspaceId} user ${userId}:`, error);
     return null;
   }
 }
 
-export async function createConversation(userId: string): Promise<ConversationRecord> {
+export async function createConversation(workspaceId: string, userId: string): Promise<ConversationRecord> {
   const newConversation: ConversationRecord = {
+    workspaceId,
     userId,
     messages: [],
     problemState: {
@@ -63,15 +71,21 @@ export async function createConversation(userId: string): Promise<ConversationRe
 
   try {
     const db = getFirestore();
-    await db.collection(CONVERSATIONS_COLLECTION).doc(userId).set(newConversation);
+    await db
+      .collection(CONVERSATIONS_COLLECTION)
+      .doc(workspaceId)
+      .collection("users")
+      .doc(userId)
+      .set(newConversation);
     return newConversation;
   } catch (error) {
-    console.error(`Failed to create conversation for user ${userId}:`, error);
+    console.error(`Failed to create conversation for workspace ${workspaceId} user ${userId}:`, error);
     throw error;
   }
 }
 
 export async function addMessageToConversation(
+  workspaceId: string,
   userId: string,
   message: Omit<Message, "timestamp">,
   problemState: ProblemState,
@@ -80,35 +94,43 @@ export async function addMessageToConversation(
 ): Promise<ConversationRecord> {
   try {
     const db = getFirestore();
-    const docRef = db.collection(CONVERSATIONS_COLLECTION).doc(userId);
-    const currentDoc = await docRef.get();
-    const currentData = currentDoc.data() as ConversationRecord | undefined;
+    const docRef = db
+      .collection(CONVERSATIONS_COLLECTION)
+      .doc(workspaceId)
+      .collection("users")
+      .doc(userId);
 
     const messageWithTimestamp: Message = {
       ...message,
       timestamp: Date.now(),
     };
 
+    // Use atomic operations to prevent race conditions:
+    // - arrayUnion() for safe concurrent message appends
+    // - increment() for version counter
+    // - set() for other fields (overwrites OK since we're updating state)
+    const admin = await import("firebase-admin");
     await docRef.update({
-      messages: (currentData?.messages || []).concat(messageWithTimestamp),
+      messages: admin.firestore.FieldValue.arrayUnion(messageWithTimestamp),
       problemState,
       state: newState,
       confidence,
       lastUpdated: new Date(),
-      version: ((currentData?.version || 0) + 1),
+      version: admin.firestore.FieldValue.increment(1),
     });
 
-    const updated = await getConversation(userId);
+    const updated = await getConversation(workspaceId, userId);
     return updated!;
   } catch (error) {
-    console.error(`Failed to add message to conversation for user ${userId}:`, error);
+    console.error(`Failed to add message to conversation for workspace ${workspaceId} user ${userId}:`, error);
     throw error;
   }
 }
 
-export async function resetConversation(userId: string): Promise<ConversationRecord> {
+export async function resetConversation(workspaceId: string, userId: string): Promise<ConversationRecord> {
   try {
     const newConversation: ConversationRecord = {
+      workspaceId,
       userId,
       messages: [],
       problemState: {
@@ -122,15 +144,20 @@ export async function resetConversation(userId: string): Promise<ConversationRec
     };
 
     const db = getFirestore();
-    await db.collection(CONVERSATIONS_COLLECTION).doc(userId).set(newConversation);
+    await db
+      .collection(CONVERSATIONS_COLLECTION)
+      .doc(workspaceId)
+      .collection("users")
+      .doc(userId)
+      .set(newConversation);
     return newConversation;
   } catch (error) {
-    console.error(`Failed to reset conversation for user ${userId}:`, error);
+    console.error(`Failed to reset conversation for workspace ${workspaceId} user ${userId}:`, error);
     throw error;
   }
 }
 
-export async function getConversationMessages(userId: string): Promise<Message[]> {
-  const conversation = await getConversation(userId);
+export async function getConversationMessages(workspaceId: string, userId: string): Promise<Message[]> {
+  const conversation = await getConversation(workspaceId, userId);
   return conversation?.messages || [];
 }

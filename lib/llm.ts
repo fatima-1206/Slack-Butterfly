@@ -739,7 +739,7 @@ Respond with ONLY a JSON array, no markdown:
         }
 
         const heuristicScore = computeHeuristicMatchScore(problemState, contact, refinement);
-        let blendedScore = Math.min(1, Math.max(0, rec.score * 0.7 + heuristicScore * 0.3));
+        let blendedScore = Math.min(1, Math.max(0, rec.score * 0.8 + heuristicScore * 0.2));
         
         // Apply validation confidence penalty
         blendedScore = blendedScore * validation.confidence;
@@ -805,6 +805,24 @@ Respond with ONLY a JSON array, no markdown:
       filtered.push(candidate);
     }
     
+    if (filtered.length === 0 && sorted.length > 0) {
+      console.log("[Ranking] No confident matches found; returning top 2 low-confidence candidates");
+      const fallback = sorted.slice(0, 2).map((candidate) => ({
+        ...candidate,
+        why: `I could not find a confident match, but ${candidate.why}`,
+        uncertainty: [
+          "No confident matches met the threshold; these are best-effort suggestions.",
+          ...candidate.uncertainty,
+        ],
+      }));
+
+      console.log(
+        "[Ranking] Fallback results:",
+        fallback.map((r) => ({ contactId: r.contactId, score: (r.score * 100).toFixed(1) + "%" }))
+      );
+      return fallback;
+    }
+
     console.log("[Ranking] After smart filtering:", filtered.length, "candidates remaining");
     console.log("[Ranking] Results:", filtered.map((r) => ({ contactId: r.contactId, score: (r.score * 100).toFixed(1) + "%" })));
     return filtered;

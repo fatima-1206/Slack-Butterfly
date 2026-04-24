@@ -5,6 +5,7 @@ import {
   createConversation,
   addMessageToConversation,
   resetConversation,
+  type ProblemState,
 } from "@/lib/conversations";
 import { getAllContacts } from "@/lib/contacts";
 
@@ -34,6 +35,7 @@ type SlackMessageEvent = {
 
 type SlackEventCallbackPayload = {
   type: "event_callback";
+  team_id?: string; // Workspace ID - added for multi-workspace support
   event: SlackMessageEvent;
 };
 
@@ -42,6 +44,22 @@ type SlackPayload = SlackUrlVerificationPayload | SlackEventCallbackPayload;
 const SLACK_SIGNATURE_HEADER = "x-slack-signature";
 const SLACK_TIMESTAMP_HEADER = "x-slack-request-timestamp";
 const MAX_REQUEST_AGE_SECONDS = 60 * 5;
+
+function getBotToken(workspaceId: string): string | null {
+  const tokenMapRaw = process.env.SLACK_BOT_TOKEN_MAP;
+  if (tokenMapRaw) {
+    try {
+      const tokenMap = JSON.parse(tokenMapRaw) as Record<string, string>;
+      if (tokenMap[workspaceId]) {
+        return tokenMap[workspaceId];
+      }
+    } catch (error) {
+      console.error("[Slack] Invalid SLACK_BOT_TOKEN_MAP JSON:", error);
+    }
+  }
+
+  return process.env.SLACK_BOT_TOKEN || null;
+}
 
 function verifySlackSignature(request: Request, rawBody: string): boolean {
   const signingSecret = process.env.SLACK_SIGNING_SECRET;
@@ -64,10 +82,10 @@ function verifySlackSignature(request: Request, rawBody: string): boolean {
   return timingSafeEqual(signatureBuffer, expectedBuffer);
 }
 
-async function getUserProfile(userId: string): Promise<UserProfile | null> {
-  const botToken = process.env.SLACK_BOT_TOKEN;
+async function getUserProfile(workspaceId: string, userId: string): Promise<UserProfile | null> {
+  const botToken = getBotToken(workspaceId);
   if (!botToken) {
-    console.warn("SLACK_BOT_TOKEN is not set.");
+    console.warn(`[Slack] No bot token configured for workspace ${workspaceId}.`);
     return null;
   }
 
@@ -124,7 +142,7 @@ async function getUserProfile(userId: string): Promise<UserProfile | null> {
   }
 }
 
-function formatProblemSummary(problemState: any): string {
+function formatProblemSummary(problemState: ProblemState): string {
   const lines = [
     `*Problem Summary:*`,
     `• Type: ${problemState.problemType || "Not specified"}`,
@@ -143,10 +161,10 @@ function formatProblemSummary(problemState: any): string {
   return lines.join("\n");
 }
 
-async function postDmReply(channel: string, text: string): Promise<void> {
-  const botToken = process.env.SLACK_BOT_TOKEN;
+async function postDmReply(workspaceId: string, channel: string, text: string): Promise<void> {
+  const botToken = getBotToken(workspaceId);
   if (!botToken) {
-    console.warn("SLACK_BOT_TOKEN is not set.");
+    console.warn(`[Slack] No bot token configured for workspace ${workspaceId}.`);
     return;
   }
 
@@ -206,10 +224,14 @@ export async function POST(request: Request) {
   }
 
   if (payload.type === "event_callback") {
-    const { event } = payload;
+    const { event, team_id: workspaceId } = payload;
+    if (!workspaceId) {
+      console.error("[Route] Missing team_id in event_callback payload");
+      return Response.json({ ok: false, error: "missing_workspace_id" }, { status: 400 });
+    }
 
     // Dedup check using event ts (timestamp) + user
-    const eventKey = `${event.user || "unknown"}-${event.ts || Date.now()}`;
+    const eventKey = `${workspaceId}-${event.user || "unknown"}-${event.ts || Date.now()}`;
     const lastSeen = recentEvents.get(eventKey);
     if (lastSeen && Date.now() - lastSeen < EVENT_DEDUP_WINDOW) {
       console.log(`[Route] Duplicate event detected (${eventKey}), ignoring`);
@@ -244,7 +266,7 @@ export async function POST(request: Request) {
       console.log(`[Route] Processing DM from ${userId}: "${userMessage.substring(0, 50)}..."`);
 
       // Process async, but respond to Slack immediately
-      processUserMessage(userId, userMessage, channelId).catch((error) => {
+      processUserMessage(workspaceId, userId, userMessage, channelId).catch((error) => {
         console.error("[Route] Background processing error:", error);
       });
 
@@ -258,12 +280,17 @@ export async function POST(request: Request) {
   return Response.json({ ok: true });
 }
 
-async function processUserMessage(userId: string, userMessage: string, channelId: string) {
+async function processUserMessage(
+  workspaceId: string,
+  userId: string,
+  userMessage: string,
+  channelId: string
+) {
   try {
-    console.log(`[Process] Starting for user ${userId}`);
+    console.log(`[Process] Starting for workspace ${workspaceId} user ${userId}`);
 
     // Fetch user profile for context awareness
-    const userProfile = await getUserProfile(userId);
+    const userProfile = await getUserProfile(workspaceId, userId);
     console.log(`[Process] User profile: role=${userProfile?.role}, title=${userProfile?.title}`);
 
     // Handle special commands
@@ -271,8 +298,9 @@ async function processUserMessage(userId: string, userMessage: string, channelId
 
     if (commandMatch === "reset") {
       console.log(`[Process] Handling 'reset' command for user ${userId}`);
-      await resetConversation(userId);
+      await resetConversation(workspaceId, userId);
       await postDmReply(
+        workspaceId,
         channelId,
         "Conversation reset. Tell me about a problem you need help solving."
       );
@@ -281,14 +309,14 @@ async function processUserMessage(userId: string, userMessage: string, channelId
 
     if (commandMatch === "status" || commandMatch === "show problem") {
       console.log(`[Process] Handling 'status' command for user ${userId}`);
-      const conversation = await getConversation(userId);
+      const conversation = await getConversation(workspaceId, userId);
       if (!conversation) {
-        await postDmReply(channelId, "No active conversation. Tell me about a problem you need help solving.");
+        await postDmReply(workspaceId, channelId, "No active conversation. Tell me about a problem you need help solving.");
       } else if (!conversation.problemState || !conversation.problemState.summary) {
-        await postDmReply(channelId, "I haven't captured a problem statement yet. Share more about what you need help with.");
+        await postDmReply(workspaceId, channelId, "I haven't captured a problem statement yet. Share more about what you need help with.");
       } else {
         const statusMsg = `${formatProblemSummary(conversation.problemState)}\n\nConfidence: ${(conversation.confidence * 100).toFixed(0)}% | Messages: ${conversation.messages.length} | State: ${conversation.state}`;
-        await postDmReply(channelId, statusMsg);
+        await postDmReply(workspaceId, channelId, statusMsg);
       }
       return;
     }
@@ -296,16 +324,16 @@ async function processUserMessage(userId: string, userMessage: string, channelId
     if (commandMatch === "help") {
       console.log(`[Process] Handling 'help' command for user ${userId}`);
       const helpText = `*Available commands:*\n• *status* or *show problem* - See my understanding of your problem\n• *reset* - Start over with a new problem\n• *help* - Show this message\n\n*How to use me:*\n1. Describe a problem you need help solving\n2. I'll ask clarifying questions to understand better\n3. Once I have enough context, I'll recommend people who can help\n4. Feedback helps me refine: "more backend people" or "that person isn't relevant"`;
-      await postDmReply(channelId, helpText);
+      await postDmReply(workspaceId, channelId, helpText);
       return;
     }
 
     // Get or create conversation
     console.log(`[Process] Fetching conversation for user ${userId}`);
-    let conversation = await getConversation(userId);
+    let conversation = await getConversation(workspaceId, userId);
     if (!conversation) {
       console.log(`[Process] Conversation not found, creating new one for user ${userId}`);
-      conversation = await createConversation(userId);
+      conversation = await createConversation(workspaceId, userId);
     }
     console.log(
       `[Process] Conversation state: ${conversation.state}, confidence: ${conversation.confidence}, messages: ${conversation.messages.length}`
@@ -335,7 +363,7 @@ async function processUserMessage(userId: string, userMessage: string, channelId
       console.log(`[Process] Entering recommendation mode${analysis.nextAction === "refine" ? " (refinement)" : ""}`);
       // We have enough info to recommend contacts
       console.log(`[Process] Fetching contacts from Slack`);
-      const allContacts = await getAllContacts();
+      const allContacts = await getAllContacts(workspaceId);
       console.log(`[Process] Fetched ${allContacts.length} contacts`);
       const contactsById = new Map(allContacts.map((c) => [c.id, c]));
 
@@ -379,6 +407,7 @@ async function processUserMessage(userId: string, userMessage: string, channelId
       console.log(`[Process] Updating conversation to recommending state`);
       // Update conversation to recommending state
       await addMessageToConversation(
+        workspaceId,
         userId,
         { role: "user", content: userMessage },
         analysis.updatedState,
@@ -399,6 +428,7 @@ async function processUserMessage(userId: string, userMessage: string, channelId
       console.log(`[Process] Clarification questions: ${analysis.clarificationQuestions.length}`);
       // Update conversation with clarification state
       await addMessageToConversation(
+        workspaceId,
         userId,
         { role: "user", content: userMessage },
         analysis.updatedState,
@@ -410,6 +440,7 @@ async function processUserMessage(userId: string, userMessage: string, channelId
     console.log(`[Process] Saving bot response to conversation`);
     // Add bot response to conversation
     await addMessageToConversation(
+      workspaceId,
       userId,
       { role: "assistant", content: botResponse },
       analysis.updatedState,
@@ -421,13 +452,14 @@ async function processUserMessage(userId: string, userMessage: string, channelId
 
     console.log(`[Process] Sending response to Slack (length: ${botResponse.length})`);
     // Send response to user
-    await postDmReply(channelId, botResponse);
+    await postDmReply(workspaceId, channelId, botResponse);
     console.log(`[Process] Completed successfully for user ${userId}`);
   } catch (error) {
     console.error("[Process] Error processing message:", error);
     try {
       console.log(`[Process] Sending error message to user`);
       await postDmReply(
+        workspaceId,
         channelId,
         "Sorry, something went wrong. Please try again or type 'reset' to start over."
       );

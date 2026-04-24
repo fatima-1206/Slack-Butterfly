@@ -2,9 +2,21 @@ import { getAllContacts } from "@/lib/contacts";
 
 export async function POST(request: Request) {
   try {
+    const { searchParams } = new URL(request.url);
+    const workspaceId = searchParams.get("workspaceId") || process.env.SLACK_WORKSPACE_ID;
+    if (!workspaceId) {
+      return Response.json(
+        {
+          success: false,
+          error: "Missing workspaceId. Provide ?workspaceId=... or set SLACK_WORKSPACE_ID.",
+        },
+        { status: 400 }
+      );
+    }
+
     console.log("[Admin] Triggering contact refresh...");
     
-    const contacts = await getAllContacts();
+    const contacts = await getAllContacts(workspaceId);
     
     console.log(`[Admin] Successfully fetched and cached ${contacts.length} contacts`);
     

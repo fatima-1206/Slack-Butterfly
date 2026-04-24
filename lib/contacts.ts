@@ -63,13 +63,30 @@ interface SlackUsersListResponse {
   };
 }
 
-let contactsCache: Contact[] | null = null;
-let cacheTimestamp = 0;
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 const CONTACTS_COLLECTION = "contacts";
 const ENRICHMENT_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_ENRICHMENT_RETRIES = 3;
 const TAVILY_BATCH_DELAY = 500; // 500ms between requests to avoid rate limits
+
+const contactsCacheByWorkspace: Map<string, Contact[]> = new Map();
+const cacheTimestampByWorkspace: Map<string, number> = new Map();
+
+function getBotToken(workspaceId: string): string | null {
+  const tokenMapRaw = process.env.SLACK_BOT_TOKEN_MAP;
+  if (tokenMapRaw) {
+    try {
+      const tokenMap = JSON.parse(tokenMapRaw) as Record<string, string>;
+      if (tokenMap[workspaceId]) {
+        return tokenMap[workspaceId];
+      }
+    } catch (error) {
+      console.error("[Contacts] Invalid SLACK_BOT_TOKEN_MAP JSON:", error);
+    }
+  }
+
+  return process.env.SLACK_BOT_TOKEN || null;
+}
 
 function isSystemContact(contact: Pick<Contact, "id" | "name">): boolean {
   const id = contact.id.toUpperCase();
@@ -272,10 +289,14 @@ async function enrichContactsBatch(
   return result;
 }
 
-async function loadContactsFromFirestore(): Promise<Contact[] | null> {
+async function loadContactsFromFirestore(workspaceId: string): Promise<Contact[] | null> {
   try {
     const db = getFirestore();
-    const snapshot = await db.collection(CONTACTS_COLLECTION).get();
+    const snapshot = await db
+      .collection(CONTACTS_COLLECTION)
+      .doc(workspaceId)
+      .collection("members")
+      .get();
     if (snapshot.empty) return null;
 
     const contacts = snapshot.docs
@@ -289,11 +310,15 @@ async function loadContactsFromFirestore(): Promise<Contact[] | null> {
 
     if (contacts.length === 0) return null;
 
-    contactsCache = contacts;
-    cacheTimestamp = Math.max(...contacts.map((c) => c.lastUpdated ?? 0));
-    return contactsCache;
+    const wsCache = contactsCacheByWorkspace;
+    wsCache.set(workspaceId, contacts);
+    cacheTimestampByWorkspace.set(workspaceId, Math.max(...contacts.map((c) => c.lastUpdated ?? 0)));
+    return contacts;
   } catch (error) {
-    console.error("Failed to load contacts from Firestore:", error);
+    console.error(
+      `Failed to load contacts from Firestore for workspace ${workspaceId}:`,
+      error
+    );
     return null;
   }
 }
@@ -302,10 +327,16 @@ async function loadContactsFromFirestore(): Promise<Contact[] | null> {
  * Load only enrichment metadata from Firestore (enrichedAt, skills, summary, etc.)
  * without filtering by freshness, so we can reuse enrichment data across cache cycles
  */
-async function loadEnrichmentMetadataFromFirestore(): Promise<Map<string, Partial<Contact>>> {
+async function loadEnrichmentMetadataFromFirestore(
+  workspaceId: string
+): Promise<Map<string, Partial<Contact>>> {
   try {
     const db = getFirestore();
-    const snapshot = await db.collection(CONTACTS_COLLECTION).get();
+    const snapshot = await db
+      .collection(CONTACTS_COLLECTION)
+      .doc(workspaceId)
+      .collection("members")
+      .get();
     if (snapshot.empty) return new Map();
 
     const enrichmentMap = new Map<string, Partial<Contact>>();
@@ -325,56 +356,66 @@ async function loadEnrichmentMetadataFromFirestore(): Promise<Map<string, Partia
 
     return enrichmentMap;
   } catch (error) {
-    console.error("Failed to load enrichment metadata from Firestore:", error);
+    console.error(
+      `Failed to load enrichment metadata from Firestore for workspace ${workspaceId}:`,
+      error
+    );
     return new Map();
   }
 }
 
-async function saveContactsToFirestore(contacts: Contact[]): Promise<void> {
+async function saveContactsToFirestore(workspaceId: string, contacts: Contact[]): Promise<void> {
   try {
     const db = getFirestore();
     const now = Date.now();
 
-    await Promise.all(
-      contacts.map((contact) =>
-        db
-          .collection(CONTACTS_COLLECTION)
-          .doc(contact.id)
-          .set({
-            ...contact,
-            lastUpdated: now,
-          })
-      )
-    );
-
-    await db
+    // Use batch writes to optimize: group up to 500 writes in a single batch
+    const batch = db.batch();
+    const workspaceCollection = db
       .collection(CONTACTS_COLLECTION)
-      .doc("_meta")
-      .set({
+      .doc(workspaceId)
+      .collection("members");
+
+    contacts.forEach((contact) => {
+      batch.set(workspaceCollection.doc(contact.id), {
+        ...contact,
         lastUpdated: now,
-        count: contacts.length,
       });
+    });
+
+    // Save metadata
+    batch.set(db.collection(CONTACTS_COLLECTION).doc(workspaceId), {
+      lastUpdated: now,
+      count: contacts.length,
+    });
+
+    await batch.commit();
   } catch (error) {
-    console.error("Failed to save contacts to Firestore:", error);
+    console.error(
+      `Failed to save contacts to Firestore for workspace ${workspaceId}:`,
+      error
+    );
   }
 }
 
-export async function getAllContacts(): Promise<Contact[]> {
-  // Return cached contacts if still fresh
-  if (contactsCache && Date.now() - cacheTimestamp < CACHE_DURATION) {
-    return contactsCache;
+export async function getAllContacts(workspaceId: string): Promise<Contact[]> {
+  // Return cached contacts if still fresh for this workspace
+  const wsCache = contactsCacheByWorkspace.get(workspaceId);
+  const wsTimestamp = cacheTimestampByWorkspace.get(workspaceId);
+  if (wsCache && wsTimestamp && Date.now() - wsTimestamp < CACHE_DURATION) {
+    return wsCache;
   }
 
   // Try Firestore cache first
-  const firestoreContacts = await loadContactsFromFirestore();
+  const firestoreContacts = await loadContactsFromFirestore(workspaceId);
   if (firestoreContacts) {
     return firestoreContacts;
   }
-  console.log("No valid cache found, fetching fresh contacts from Slack...");
+  console.log(`[Contacts] No valid cache found for workspace ${workspaceId}, fetching fresh from Slack...`);
 
   try {
     // this gets triggered when the cache is stale or doesn't exist, so we fetch fresh data from Slack
-    const slackUsers = await fetchSlackUsers();
+    const slackUsers = await fetchSlackUsers(workspaceId);
 
     // Filter out bots and deleted users. Do not require email because many workspaces
     // do not expose email via users.list unless users:read.email scope is granted.
@@ -390,7 +431,7 @@ export async function getAllContacts(): Promise<Contact[]> {
     );
 
     // Load existing enrichment metadata from Firestore before creating fresh contacts
-    const enrichmentMetadata = await loadEnrichmentMetadataFromFirestore();
+    const enrichmentMetadata = await loadEnrichmentMetadataFromFirestore(workspaceId);
 
     let contacts: Contact[] = activeUsers
       .map((user) => {
@@ -408,35 +449,30 @@ export async function getAllContacts(): Promise<Contact[]> {
     console.log(`[Enrichment] Starting enrichment for ${contacts.length} contacts...`);
     contacts = await enrichContactsBatch(contacts);
 
-    contactsCache = contacts;
-    cacheTimestamp = Date.now();
+    // Update workspace cache
+    contactsCacheByWorkspace.set(workspaceId, contacts);
+    cacheTimestampByWorkspace.set(workspaceId, Date.now());
 
     // Persist to Firestore cache
-    await saveContactsToFirestore(contactsCache);
+    await saveContactsToFirestore(workspaceId, contacts);
 
-    return contactsCache;
+    return contacts;
   } catch (error) {
-    console.error("Failed to fetch Slack contacts:", error);
+    console.error(`Failed to fetch Slack contacts for workspace ${workspaceId}:`, error);
     return [];
   }
 }
 
-export function getContactById(id: string): Contact | undefined {
-  if (!contactsCache) {
-    return undefined;
-  }
-  return contactsCache.find((c) => c.id === id);
+export function getContactById(id: string, contacts: Contact[]): Contact | undefined {
+  return contacts.find((c) => c.id === id);
 }
 
 export function filterContactsBySkills(
   skills: string[],
+  contacts: Contact[],
   threshold = 1
 ): Contact[] {
-  if (!contactsCache) {
-    return [];
-  }
-
-  return contactsCache.filter((contact) => {
+  return contacts.filter((contact) => {
     if (!contact.skills) return false;
     const matchCount = skills.filter((skill) =>
       contact.skills?.some(
@@ -449,11 +485,8 @@ export function filterContactsBySkills(
   });
 }
 
-export function filterContactsByDomain(domain: string): Contact[] {
+export function filterContactsByDomain(domain: string, contacts: Contact[]): Contact[] {
   console.log(`Filtering contacts by domain: ${domain}`);
-  if (!contactsCache) {
-    return [];
-  }
 
   const domainKeywords = {
     ml: ["ML", "AI", "Machine Learning", "LLM", "Neural", "Data Science"],
@@ -479,17 +512,17 @@ export function filterContactsByDomain(domain: string): Contact[] {
 
   const keywords = domainKeywords[domain as keyof typeof domainKeywords] || [];
 
-  return contactsCache.filter((contact) => {
+  return contacts.filter((contact) => {
     const text = `${contact.title} ${contact.skills?.join(" ") || ""}`.toLowerCase();
     return keywords.some((kw) => text.includes(kw.toLowerCase()));
   });
 }
 
-async function fetchSlackUsers(): Promise<SlackUser[]> {
+async function fetchSlackUsers(workspaceId: string): Promise<SlackUser[]> {
   console.log("Fetching Slack users...👥");
-  const botToken = process.env.SLACK_BOT_TOKEN;
+  const botToken = getBotToken(workspaceId);
   if (!botToken) {
-    throw new Error("SLACK_BOT_TOKEN is not configured");
+    throw new Error(`Slack bot token is not configured for workspace ${workspaceId}`);
   }
 
   const response = await fetch("https://slack.com/api/users.list", {
