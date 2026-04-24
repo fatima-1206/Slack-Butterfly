@@ -15,6 +15,14 @@ export interface Contact {
   email: string;
   avatar?: string;
   lastUpdated?: number;
+  enrichedAt?: number; // timestamp when enrichment was last attempted
+  enrichmentAttempts?: number; // count of enrichment attempts (for rate limit tracking)
+}
+
+interface TavilyEnrichmentResult {
+  skills: string[];
+  summary: string;
+  experience: string;
 }
 
 interface SlackUser {
@@ -59,11 +67,208 @@ let contactsCache: Contact[] | null = null;
 let cacheTimestamp = 0;
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 const CONTACTS_COLLECTION = "contacts";
+const ENRICHMENT_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000; // 7 days
+const MAX_ENRICHMENT_RETRIES = 3;
+const TAVILY_BATCH_DELAY = 500; // 500ms between requests to avoid rate limits
 
 function isSystemContact(contact: Pick<Contact, "id" | "name">): boolean {
   const id = contact.id.toUpperCase();
   const name = contact.name.toLowerCase();
   return id === "USLACKBOT" || name.includes("slackbot");
+}
+
+/**
+ * Enrich a single contact using Tavily API
+ * Returns enriched data or null if enrichment fails
+ */
+async function enrichContactWithTavily(contact: Contact): Promise<TavilyEnrichmentResult | null> {
+  const tavilyKey = process.env.TAVILY_API_KEY;
+  if (!tavilyKey) {
+    console.warn("TAVILY_API_KEY not set, skipping enrichment");
+    return null;
+  }
+
+  try {
+    const payload = {
+      api_key: tavilyKey,
+      query: `${contact.name} ${contact.title} professional profile`,
+      include_domains: ["linkedin.com", "github.com", "twitter.com"],
+      max_results: 5,
+    };
+
+    const response = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      console.warn(
+        `Tavily API error for ${contact.name}: ${response.status} ${response.statusText}`
+      );
+      return null;
+    }
+
+    const data = (await response.json()) as {
+      results?: Array<{
+        title?: string;
+        content?: string;
+        source?: string;
+      }>;
+    };
+
+    if (!data.results || data.results.length === 0) {
+      console.log(`[Tavily] No results found for ${contact.name}`);
+      return null;
+    }
+
+    // Extract skills and experience from search results
+    const combinedText = data.results
+      .map((r) => `${r.title || ""} ${r.content || ""}`)
+      .join(" ");
+
+    // Parse skills (look for common tech keywords and job titles context)
+    const skillKeywords = [
+      "python",
+      "javascript",
+      "typescript",
+      "nodejs",
+      "react",
+      "vue",
+      "angular",
+      "aws",
+      "gcp",
+      "azure",
+      "docker",
+      "kubernetes",
+      "sql",
+      "mongo",
+      "firebase",
+      "machine learning",
+      "ai",
+      "nlp",
+      "data science",
+      "backend",
+      "frontend",
+      "fullstack",
+      "devops",
+      "security",
+      "infrastructure",
+      "distributed systems",
+    ];
+
+    const textLower = combinedText.toLowerCase();
+    const skills = skillKeywords.filter((skill) => textLower.includes(skill));
+
+    // Extract summary (use first 300 chars from first result that looks like a profile)
+    const summary = data.results
+      .filter((r) => r.content && r.content.length > 50)
+      .map((r) => r.content || "")
+      .join(" ")
+      .substring(0, 300)
+      .trim();
+
+    // Extract experience info (mentions of companies, roles)
+    const experience = data.results
+      .filter((r) => r.title)
+      .slice(0, 3)
+      .map((r) => r.title || "")
+      .join("; ");
+
+    return {
+      skills: [...new Set(skills)], // deduplicate
+      summary: summary || `Professional profile for ${contact.name}`,
+      experience: experience || `${contact.title}`,
+    };
+  } catch (error) {
+    console.error(`[Tavily] Enrichment failed for ${contact.name}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Check if contact needs re-enrichment
+ */
+function shouldEnrichContact(contact: Contact): boolean {
+  // Don't re-enrich if we've enriched recently
+  if (contact.enrichedAt) {
+    const timeSinceEnrichment = Date.now() - contact.enrichedAt;
+    if (timeSinceEnrichment < ENRICHMENT_CACHE_DURATION) {
+      return false;
+    }
+  }
+
+  // Don't re-enrich if we've hit max retries recently
+  if (
+    contact.enrichmentAttempts &&
+    contact.enrichmentAttempts >= MAX_ENRICHMENT_RETRIES
+  ) {
+    // Only retry after cache expires
+    const lastUpdated = contact.lastUpdated || 0;
+    if (Date.now() - lastUpdated < ENRICHMENT_CACHE_DURATION) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Enrich multiple contacts with Tavily, respecting rate limits
+ */
+async function enrichContactsBatch(
+  contacts: Contact[]
+): Promise<Contact[]> {
+  const toEnrich = contacts.filter(shouldEnrichContact);
+
+  if (toEnrich.length === 0) {
+    console.log("[Enrichment] All contacts already enriched or rate-limited");
+    return contacts;
+  }
+
+  console.log(
+    `[Enrichment] Enriching ${toEnrich.length}/${contacts.length} contacts with Tavily...`
+  );
+
+  const enrichedContacts = await Promise.all(
+    toEnrich.map(async (contact) => {
+      const enrichmentResult = await enrichContactWithTavily(contact);
+
+      if (enrichmentResult) {
+        return {
+          ...contact,
+          skills: enrichmentResult.skills.length > 0 ? enrichmentResult.skills : contact.skills,
+          summary: enrichmentResult.summary || contact.summary,
+          experience: enrichmentResult.experience || contact.experience,
+          enrichedAt: Date.now(),
+          enrichmentAttempts: 1,
+        };
+      } else {
+        // Track failed attempt for rate limiting
+        return {
+          ...contact,
+          enrichedAt: Date.now(),
+          enrichmentAttempts: (contact.enrichmentAttempts || 0) + 1,
+        };
+      }
+    })
+  );
+
+  // Interleave delays to respect rate limits during batch processing
+  const result = [...contacts];
+  let enrichmentIndex = 0;
+  for (const enriched of enrichedContacts) {
+    const originalIndex = result.findIndex((c) => c.id === enriched.id);
+    if (originalIndex !== -1) {
+      result[originalIndex] = enriched;
+      enrichmentIndex++;
+      if (enrichmentIndex < enrichedContacts.length) {
+        await new Promise((resolve) => setTimeout(resolve, TAVILY_BATCH_DELAY));
+      }
+    }
+  }
+
+  return result;
 }
 
 async function loadContactsFromFirestore(): Promise<Contact[] | null> {
@@ -151,13 +356,18 @@ export async function getAllContacts(): Promise<Contact[]> {
       `[Contacts] Slack users total=${slackUsers.length}, active=${activeUsers.length}, filteredOut=${filteredOut}`
     );
 
-
-    contactsCache = activeUsers
+    let contacts: Contact[] = activeUsers
       .map((user) => ({
-      ...transformSlackUserToContact(user),
-      lastUpdated: Date.now(),
-      }))
+        ...transformSlackUserToContact(user),
+        lastUpdated: Date.now(),
+      } as Contact))
       .filter((contact) => !isSystemContact(contact));
+
+    // Enrich contacts with Tavily (async, non-blocking for cache)
+    console.log(`[Enrichment] Starting enrichment for ${contacts.length} contacts...`);
+    contacts = await enrichContactsBatch(contacts);
+
+    contactsCache = contacts;
     cacheTimestamp = Date.now();
 
     // Persist to Firestore cache
