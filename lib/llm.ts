@@ -729,8 +729,11 @@ Respond with ONLY a JSON array, no markdown:
           return rec;
         }
 
+        // Patch: ensure contact has all required Contact fields for validation
+        const contactForValidation = { email: '', ...contact };
+
         // Validate that we matched the right person
-        const validation = validateContact(contact, problemState.keyNeeds);
+        const validation = validateContact(contactForValidation, problemState.keyNeeds);
         if (!validation.isValid) {
           console.log(`[Ranking] Contact ${contact.name} failed validation:`, validation.issues);
         }
