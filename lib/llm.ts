@@ -81,10 +81,41 @@ function normalizeStringArray(value: unknown): string[] {
 
 function parseJsonFromResponse<T>(content: string, fallback: T): T {
   try {
-    const jsonMatch = content.match(/\{[\s\S]*\}/) || content.match(/\[[\s\S]*\]/);
-    const parsed = JSON.parse(jsonMatch?.[0] || content);
+    // Try parsing the content as-is first
+    try {
+      const parsed = JSON.parse(content);
+      return parsed as T;
+    } catch {
+      // If that fails, try to extract JSON by finding brackets
+    }
+    
+    // For arrays, look for the first [ and last ]
+    if (Array.isArray(fallback)) {
+      const arrayStart = content.indexOf("[");
+      const arrayEnd = content.lastIndexOf("]");
+      if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
+        const jsonStr = content.substring(arrayStart, arrayEnd + 1);
+        const parsed = JSON.parse(jsonStr);
+        return parsed as T;
+      }
+    } else {
+      // For objects, look for the first { and last }
+      const objStart = content.indexOf("{");
+      const objEnd = content.lastIndexOf("}");
+      if (objStart !== -1 && objEnd !== -1 && objEnd > objStart) {
+        const jsonStr = content.substring(objStart, objEnd + 1);
+        const parsed = JSON.parse(jsonStr);
+        return parsed as T;
+      }
+    }
+
+    // Last resort: try the old regex method
+    const jsonMatch = content.match(/\{[\s\S]*?\}/) || content.match(/\[[\s\S]*?\]/);
+    const jsonStr = jsonMatch?.[0] || content;
+    const parsed = JSON.parse(jsonStr);
     return parsed as T;
-  } catch {
+  } catch (error) {
+    console.error("[Parser] Failed to extract JSON from content (length:", content.length, ", error:", (error as Error).message, ")");
     return fallback;
   }
 }
@@ -219,7 +250,7 @@ function getLLMConfig() {
   };
 }
 
-export async function callLLM(messages: LLMMessage[], temperature = 0.7): Promise<LLMResponse> {
+export async function callLLM(messages: LLMMessage[], temperature = 0.7, maxTokens = 1024): Promise<LLMResponse> {
   const config = getLLMConfig();
 
   if (!config.token) {
@@ -239,7 +270,7 @@ export async function callLLM(messages: LLMMessage[], temperature = 0.7): Promis
         content: m.content,
       })),
       temperature,
-      max_tokens: 1024,
+      max_tokens: maxTokens,
     });
 
     const content = response.choices[0]?.message?.content || "";
@@ -264,7 +295,7 @@ export async function callLLM(messages: LLMMessage[], temperature = 0.7): Promis
         content: m.content,
       })),
       temperature,
-      max_tokens: 1024,
+      max_tokens: maxTokens,
     });
 
     const content = response.choices[0]?.message?.content || "";
@@ -564,8 +595,12 @@ export async function rankContacts(
 ,
   refinement?: RecommendationRefinement
 ): Promise<RankedContactRecord[]> {
+
+  console.log("DEBUG: Starting contact ranking with", contacts.length, "contacts and refinement:", refinement);
   const excludedContactIds = new Set(refinement?.excludedContactIds || []);
   const candidatePool = contacts.filter((contact) => !excludedContactIds.has(contact.id));
+
+  console.log("DEBUG: Candidate pool size after filtering:", candidatePool.length);
 
   if (candidatePool.length === 0) {
     return [];
@@ -574,6 +609,8 @@ export async function rankContacts(
   // If too many contacts, filter first
   let filteredContacts = candidatePool;
   if (candidatePool.length > 20) {
+
+    console.log(`Filtering down from ${candidatePool.length} contacts before ranking...`);
     const filterPrompt = `Given this problem, which of these ${candidatePool.length} people would be worth investigating further?
     
 Problem needs: ${problemState.keyNeeds.join(", ")}
@@ -596,11 +633,14 @@ ${candidatePool.map((c) => `- ${c.id}: ${c.name} (${c.title} at ${c.organization
       filteredContacts = candidatePool.filter((c) => filtered.includes(c.id));
     } catch {
       // If filtering fails, use top contacts by name match
+      console.log("LLM filtering failed, falling back to heuristic name matching...");
       filteredContacts = candidatePool.slice(0, 10);
     }
   }
 
   if (filteredContacts.length === 0) {
+
+    console.log("LLM filtering resulted in no candidates, falling back to heuristic filtering...");
     filteredContacts = candidatePool.slice(0, 10);
   }
 
@@ -651,13 +691,18 @@ Respond with ONLY a JSON array, no markdown:
 
   const rankResponse = await callLLM(
     [{ role: "user", content: rankingPrompt }],
-    0.3
+    0.3,
+    2048 // Increase max_tokens for ranking - needs space for detailed JSON
   );
+
+  console.log("[Ranking] LLM Response (length:", rankResponse.content.length, "):");
+  console.log("[Ranking] Full response:", rankResponse.content);
 
   try {
     const parsed = parseJsonFromResponse<
       Array<Partial<RankedContactRecord>>
     >(rankResponse.content, []);
+    console.log("[Ranking] Parsed", parsed.length, "candidates from LLM response");
 
     const scored: RankedContactRecord[] = parsed
       .filter(
@@ -695,14 +740,18 @@ Respond with ONLY a JSON array, no markdown:
         };
       });
 
-    // Sort by score descending, drop weak matches, and return top 5.
-    return scored
-      .filter((record) => record.score >= 0.35)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
+    // Sort by score descending, drop very weak matches (< 0.15), and return top 5.
+    // For small contact pools, we're lenient and show weak matches too.
+    const filtered = scored.filter((record) => record.score >= 0.15);
+    console.log("[Ranking] After filtering (>= 0.15):", filtered.length, "candidates remaining");
+    const sorted = filtered.sort((a, b) => b.score - a.score);
+    const result = sorted.slice(0, 5);
+    console.log("[Ranking] Top 5 results:", result.map((r) => ({ contactId: r.contactId, score: r.score })));
+    return result;
   } catch (error) {
-    console.error("Failed to parse ranking response:", rankResponse.content, error);
-    return filteredContacts
+    console.error("[Ranking] Failed to parse ranking response:", rankResponse.content, error);
+    console.log("[Ranking] Falling back to heuristic scoring for", filteredContacts.length, "contacts");
+    const heuristicResults = filteredContacts
       .map((contact) => ({
         contactId: contact.id,
         score: computeHeuristicMatchScore(problemState, contact, refinement),
@@ -712,8 +761,10 @@ Respond with ONLY a JSON array, no markdown:
         ),
         uncertainty: ["Model parsing failed, so this ranking is heuristic only."],
       }))
-      .filter((candidate) => candidate.score >= 0.35)
+      .filter((candidate) => candidate.score >= 0.20)
       .sort((a, b) => b.score - a.score)
       .slice(0, 5);
+    console.log("[Ranking] Heuristic fallback returned", heuristicResults.length, "candidates");
+    return heuristicResults;
   }
 }
