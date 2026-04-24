@@ -190,26 +190,26 @@ async function enrichContactWithTavily(contact: Contact): Promise<TavilyEnrichme
  * Check if contact needs re-enrichment
  */
 function shouldEnrichContact(contact: Contact): boolean {
-  // Don't re-enrich if we've enriched recently
+  // If successfully enriched recently, don't re-enrich
   if (contact.enrichedAt) {
     const timeSinceEnrichment = Date.now() - contact.enrichedAt;
     if (timeSinceEnrichment < ENRICHMENT_CACHE_DURATION) {
-      return false;
+      return false; // Already successfully enriched
     }
   }
 
-  // Don't re-enrich if we've hit max retries recently
+  // If we've hit max retries on a contact that never got enriched,
+  // give up for now (skip enrichment). This prevents hammering Tavily
+  // for contacts that consistently fail (wrong name, no results, etc.)
   if (
+    !contact.enrichedAt &&
     contact.enrichmentAttempts &&
     contact.enrichmentAttempts >= MAX_ENRICHMENT_RETRIES
   ) {
-    // Only retry after cache expires
-    const lastUpdated = contact.lastUpdated || 0;
-    if (Date.now() - lastUpdated < ENRICHMENT_CACHE_DURATION) {
-      return false;
-    }
+    return false; // Give up on this contact for now
   }
 
+  // Otherwise, try to enrich (either first time, or cache expired)
   return true;
 }
 
@@ -240,15 +240,16 @@ async function enrichContactsBatch(
           skills: enrichmentResult.skills.length > 0 ? enrichmentResult.skills : contact.skills,
           summary: enrichmentResult.summary || contact.summary,
           experience: enrichmentResult.experience || contact.experience,
-          enrichedAt: Date.now(),
+          enrichedAt: Date.now(), // ✅ Only mark as enriched on SUCCESS
           enrichmentAttempts: 1,
         };
       } else {
-        // Track failed attempt for rate limiting
+        // ⚠️ DON'T set enrichedAt on failure - let it retry next time
+        // But track attempts for eventual rate limiting
         return {
           ...contact,
-          enrichedAt: Date.now(),
           enrichmentAttempts: (contact.enrichmentAttempts || 0) + 1,
+          // Do NOT set enrichedAt - this allows shouldEnrichContact() to retry
         };
       }
     })
@@ -294,6 +295,38 @@ async function loadContactsFromFirestore(): Promise<Contact[] | null> {
   } catch (error) {
     console.error("Failed to load contacts from Firestore:", error);
     return null;
+  }
+}
+
+/**
+ * Load only enrichment metadata from Firestore (enrichedAt, skills, summary, etc.)
+ * without filtering by freshness, so we can reuse enrichment data across cache cycles
+ */
+async function loadEnrichmentMetadataFromFirestore(): Promise<Map<string, Partial<Contact>>> {
+  try {
+    const db = getFirestore();
+    const snapshot = await db.collection(CONTACTS_COLLECTION).get();
+    if (snapshot.empty) return new Map();
+
+    const enrichmentMap = new Map<string, Partial<Contact>>();
+
+    snapshot.docs
+      .filter((d) => d.id !== "_meta")
+      .forEach((doc) => {
+        const data = doc.data() as Contact;
+        enrichmentMap.set(data.id, {
+          skills: data.skills,
+          summary: data.summary,
+          experience: data.experience,
+          enrichedAt: data.enrichedAt,
+          enrichmentAttempts: data.enrichmentAttempts,
+        });
+      });
+
+    return enrichmentMap;
+  } catch (error) {
+    console.error("Failed to load enrichment metadata from Firestore:", error);
+    return new Map();
   }
 }
 
@@ -356,11 +389,19 @@ export async function getAllContacts(): Promise<Contact[]> {
       `[Contacts] Slack users total=${slackUsers.length}, active=${activeUsers.length}, filteredOut=${filteredOut}`
     );
 
+    // Load existing enrichment metadata from Firestore before creating fresh contacts
+    const enrichmentMetadata = await loadEnrichmentMetadataFromFirestore();
+
     let contacts: Contact[] = activeUsers
-      .map((user) => ({
-        ...transformSlackUserToContact(user),
-        lastUpdated: Date.now(),
-      } as Contact))
+      .map((user) => {
+        const baseContact = transformSlackUserToContact(user);
+        const enrichedMeta = enrichmentMetadata.get(user.id);
+        return {
+          ...baseContact,
+          ...enrichedMeta,
+          lastUpdated: Date.now(),
+        } as Contact;
+      })
       .filter((contact) => !isSystemContact(contact));
 
     // Enrich contacts with Tavily (async, non-blocking for cache)
@@ -463,7 +504,7 @@ async function fetchSlackUsers(): Promise<SlackUser[]> {
   console.log("[SlackAPI] Response OK:", data.ok);
   console.log("[SlackAPI] Members count:", data.members?.length ?? 0);
   console.log("[SlackAPI] Error:", data.error);
-  console.log("[SlackAPI] Full response:", JSON.stringify(data, null, 2));
+  // console.log("[SlackAPI] Full response:", JSON.stringify(data, null, 2));
 
   if (!data.ok) {
     throw new Error(`Slack API error: ${data.error}`);
@@ -548,4 +589,72 @@ function extractSkillsFromProfile(
   }
 
   return skills.length > 0 ? skills : undefined;
+}
+
+/**
+ * Validate a contact to ensure it matches the intended person
+ * Checks for consistency between title, skills, and enriched data
+ */
+export function validateContact(contact: Contact, requiredSkills: string[]): {
+  isValid: boolean;
+  confidence: number;
+  issues: string[];
+} {
+  const issues: string[] = [];
+  let confidence = 1.0;
+
+  // Check if title contains relevant keywords
+  const titleLower = contact.title.toLowerCase();
+  const hasRelevantTitle = requiredSkills.some((skill) =>
+    titleLower.includes(skill.toLowerCase())
+  );
+
+  if (!hasRelevantTitle && requiredSkills.length > 0) {
+    issues.push(`Title "${contact.title}" doesn't contain expected skills`);
+    confidence -= 0.15;
+  }
+
+  // Check if skills align with required skills
+  if (contact.skills && contact.skills.length > 0 && requiredSkills.length > 0) {
+    const matchedSkills = requiredSkills.filter((req) =>
+      contact.skills?.some(
+        (s) =>
+          s.toLowerCase().includes(req.toLowerCase()) ||
+          req.toLowerCase().includes(s.toLowerCase())
+      )
+    );
+
+    if (matchedSkills.length === 0) {
+      issues.push(`No skills match: required ${requiredSkills.join(", ")}, found ${contact.skills.join(", ")}`);
+      confidence -= 0.25;
+    } else if (matchedSkills.length < requiredSkills.length * 0.5) {
+      issues.push(`Weak skill match: only ${matchedSkills.length}/${requiredSkills.length} skills align`);
+      confidence -= 0.1;
+    }
+  }
+
+  // Check if summary/experience contains relevant keywords
+  if (contact.summary || contact.experience) {
+    const combinedText = `${contact.summary || ""} ${contact.experience || ""}`.toLowerCase();
+    const hasRelevantContext = requiredSkills.some((skill) =>
+      combinedText.includes(skill.toLowerCase())
+    );
+
+    if (!hasRelevantContext && requiredSkills.length > 0) {
+      issues.push("Summary/experience doesn't mention required skills");
+      confidence -= 0.1;
+    }
+  } else {
+    // No enriched data adds some uncertainty
+    confidence -= 0.05;
+  }
+
+  // Contact is valid if confidence >= 0.35 (weak but acceptable)
+  const isValid = confidence >= 0.35;
+
+  return {
+    isValid,
+    confidence: Math.max(0, confidence),
+    issues,
+  };
 }
