@@ -4,6 +4,7 @@
 
 import OpenAI from "openai";
 import { Groq } from "groq-sdk";
+import { validateContact } from "@/lib/contacts";
 
 type LLMProvider = "groq" | "github";
 
@@ -592,12 +593,12 @@ export async function rankContacts(
     summary?: string;
     skills?: string[];
     experience?: string;
-  }>
-,
-  refinement?: RecommendationRefinement
+  }>,
+  refinement?: RecommendationRefinement,
+  requesterRole?: "developer" | "pm" | "designer" | "leadership" | "other"
 ): Promise<RankedContactRecord[]> {
 
-  console.log("DEBUG: Starting contact ranking with", contacts.length, "contacts and refinement:", refinement);
+  console.log("DEBUG: Starting contact ranking with", contacts.length, "contacts, requesterRole:", requesterRole, "and refinement:", refinement);
   const excludedContactIds = new Set(refinement?.excludedContactIds || []);
   const candidatePool = contacts.filter((contact) => !excludedContactIds.has(contact.id));
 
@@ -646,6 +647,10 @@ ${candidatePool.map((c) => `- ${c.id}: ${c.name} (${c.title} at ${c.organization
   }
 
   const rankingPrompt = `You are matching people to solve a specific problem.
+
+REQUESTER CONTEXT:
+- Role: ${requesterRole || "unknown"}
+- Note: Different roles have different needs. A developer may want implementation details, while a PM may want strategy/roadmap input.
 
 PROBLEM:
 ${JSON.stringify(problemState, null, 2)}
@@ -724,8 +729,19 @@ Respond with ONLY a JSON array, no markdown:
           return rec;
         }
 
+        // Validate that we matched the right person
+        const validation = validateContact(contact, problemState.keyNeeds);
+        if (!validation.isValid) {
+          console.log(`[Ranking] Contact ${contact.name} failed validation:`, validation.issues);
+        }
+
         const heuristicScore = computeHeuristicMatchScore(problemState, contact, refinement);
-        const blendedScore = Math.min(1, Math.max(0, rec.score * 0.7 + heuristicScore * 0.3));
+        let blendedScore = Math.min(1, Math.max(0, rec.score * 0.7 + heuristicScore * 0.3));
+        
+        // Apply validation confidence penalty
+        blendedScore = blendedScore * validation.confidence;
+        
+        console.log(`[Ranking] ${contact.name}: LLM=${rec.score.toFixed(2)}, heuristic=${heuristicScore.toFixed(2)}, validationConfidence=${validation.confidence.toFixed(2)}, final=${blendedScore.toFixed(2)}`);
 
         const strengthsMatched = new Set(normalizeStringArray(rec.strengthsMatched));
 
@@ -737,10 +753,17 @@ Respond with ONLY a JSON array, no markdown:
           }
         });
 
+        // Add validation issues to uncertainty
+        const uncertainty = [...rec.uncertainty];
+        if (validation.issues.length > 0) {
+          uncertainty.push(...validation.issues);
+        }
+
         return {
           ...rec,
           score: blendedScore,
           strengthsMatched: [...strengthsMatched],
+          uncertainty,
         };
       });
 

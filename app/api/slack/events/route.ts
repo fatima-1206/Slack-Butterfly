@@ -8,6 +8,14 @@ import {
 } from "@/lib/conversations";
 import { getAllContacts } from "@/lib/contacts";
 
+type UserProfile = {
+  id: string;
+  name: string;
+  title?: string;
+  isBot: boolean;
+  role?: "developer" | "pm" | "designer" | "leadership" | "other";
+};
+
 type SlackUrlVerificationPayload = {
   type: "url_verification";
   challenge: string;
@@ -54,6 +62,85 @@ function verifySlackSignature(request: Request, rawBody: string): boolean {
   const expectedBuffer = Buffer.from(expectedSignature);
   if (signatureBuffer.length !== expectedBuffer.length) return false;
   return timingSafeEqual(signatureBuffer, expectedBuffer);
+}
+
+async function getUserProfile(userId: string): Promise<UserProfile | null> {
+  const botToken = process.env.SLACK_BOT_TOKEN;
+  if (!botToken) {
+    console.warn("SLACK_BOT_TOKEN is not set.");
+    return null;
+  }
+
+  try {
+    const response = await fetch("https://slack.com/api/users.info", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${botToken}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({ user: userId }),
+    });
+
+    const data = (await response.json()) as {
+      ok?: boolean;
+      user?: {
+        id: string;
+        real_name: string;
+        profile?: { title?: string; real_name?: string; display_name?: string };
+        is_bot?: boolean;
+      };
+    };
+
+    if (!data.ok || !data.user) {
+      return null;
+    }
+
+    const title = data.user.profile?.title || "";
+    const name = data.user.real_name || data.user.profile?.display_name || "User";
+
+    // Infer role from title
+    const titleLower = title.toLowerCase();
+    let role: UserProfile["role"] = "other";
+    if (titleLower.includes("engineer") || titleLower.includes("developer")) {
+      role = "developer";
+    } else if (titleLower.includes("manager") || titleLower.includes("pm")) {
+      role = "pm";
+    } else if (titleLower.includes("designer")) {
+      role = "designer";
+    } else if (titleLower.includes("ceo") || titleLower.includes("cto") || titleLower.includes("founder") || titleLower.includes("lead")) {
+      role = "leadership";
+    }
+
+    return {
+      id: userId,
+      name,
+      title: title || undefined,
+      isBot: data.user.is_bot || false,
+      role,
+    };
+  } catch (error) {
+    console.error("[UserProfile] Failed to fetch user info:", error);
+    return null;
+  }
+}
+
+function formatProblemSummary(problemState: any): string {
+  const lines = [
+    `*Problem Summary:*`,
+    `• Type: ${problemState.problemType || "Not specified"}`,
+    `• Summary: ${problemState.summary}`,
+    `• Key Needs: ${problemState.keyNeeds?.join(", ") || "None"}`,
+  ];
+  if (problemState.constraints?.length) {
+    lines.push(`• Constraints: ${problemState.constraints.join(", ")}`);
+  }
+  if (problemState.urgency) {
+    lines.push(`• Urgency: ${problemState.urgency}`);
+  }
+  if (problemState.domain) {
+    lines.push(`• Domain: ${problemState.domain}`);
+  }
+  return lines.join("\n");
 }
 
 async function postDmReply(channel: string, text: string): Promise<void> {
@@ -175,14 +262,41 @@ async function processUserMessage(userId: string, userMessage: string, channelId
   try {
     console.log(`[Process] Starting for user ${userId}`);
 
+    // Fetch user profile for context awareness
+    const userProfile = await getUserProfile(userId);
+    console.log(`[Process] User profile: role=${userProfile?.role}, title=${userProfile?.title}`);
+
     // Handle special commands
-    if (userMessage.toLowerCase() === "reset") {
+    const commandMatch = userMessage.trim().toLowerCase();
+
+    if (commandMatch === "reset") {
       console.log(`[Process] Handling 'reset' command for user ${userId}`);
       await resetConversation(userId);
       await postDmReply(
         channelId,
         "Conversation reset. Tell me about a problem you need help solving."
       );
+      return;
+    }
+
+    if (commandMatch === "status" || commandMatch === "show problem") {
+      console.log(`[Process] Handling 'status' command for user ${userId}`);
+      const conversation = await getConversation(userId);
+      if (!conversation) {
+        await postDmReply(channelId, "No active conversation. Tell me about a problem you need help solving.");
+      } else if (!conversation.problemState || !conversation.problemState.summary) {
+        await postDmReply(channelId, "I haven't captured a problem statement yet. Share more about what you need help with.");
+      } else {
+        const statusMsg = `${formatProblemSummary(conversation.problemState)}\n\nConfidence: ${(conversation.confidence * 100).toFixed(0)}% | Messages: ${conversation.messages.length} | State: ${conversation.state}`;
+        await postDmReply(channelId, statusMsg);
+      }
+      return;
+    }
+
+    if (commandMatch === "help") {
+      console.log(`[Process] Handling 'help' command for user ${userId}`);
+      const helpText = `*Available commands:*\n• *status* or *show problem* - See my understanding of your problem\n• *reset* - Start over with a new problem\n• *help* - Show this message\n\n*How to use me:*\n1. Describe a problem you need help solving\n2. I'll ask clarifying questions to understand better\n3. Once I have enough context, I'll recommend people who can help\n4. Feedback helps me refine: "more backend people" or "that person isn't relevant"`;
+      await postDmReply(channelId, helpText);
       return;
     }
 
@@ -231,7 +345,8 @@ async function processUserMessage(userId: string, userMessage: string, channelId
       const recommendations = await rankContacts(
         analysis.updatedState,
         allContacts,
-        analysis.refinement
+        analysis.refinement,
+        userProfile?.role
       );
       console.log(`[Process] Got ${recommendations.length} recommendations`);
 
@@ -258,7 +373,7 @@ async function processUserMessage(userId: string, userMessage: string, channelId
             ? `\n\nI biased this round toward ${analysis.refinement.preferredDirections.join(", ")}.`
             : "";
 
-        botResponse = `Great! I found ${recommendations.length} people who might help:\n\n${recommendationText}${refinementHint}\n\nIf this is close but not quite right, tell me what to shift toward and I’ll rerank.`;
+        botResponse = `Great! I found ${recommendations.length} people who might help:\n\n${recommendationText}${refinementHint}\n\n_Type "status" to see my understanding of the problem, or give me feedback to refine the results._`;
       }
 
       console.log(`[Process] Updating conversation to recommending state`);
