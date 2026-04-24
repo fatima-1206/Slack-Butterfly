@@ -1,5 +1,5 @@
 /**
- * Mock contacts database for testing
+ * Fetch contacts from Slack workspace members
  */
 
 export interface Contact {
@@ -11,127 +11,201 @@ export interface Contact {
   skills?: string[];
   experience?: string;
   email: string;
+  avatar?: string;
 }
 
-// Mock contact database
-const CONTACTS: Contact[] = [
-  {
-    id: "U001",
-    name: "Alice Chen",
-    title: "Senior ML Engineer",
-    organization: "Google",
-    summary: "Specialist in NLP and transformers, 8 years experience",
-    skills: ["Python", "NLP", "TensorFlow", "PyTorch", "Transformers"],
-    experience: "Built recommendation systems and NLP models at scale",
-    email: "alice.chen@example.com",
-  },
-  {
-    id: "U002",
-    name: "Bob Martinez",
-    title: "Full Stack Engineer",
-    organization: "Meta",
-    summary: "Expert in backend systems and API design",
-    skills: ["Node.js", "TypeScript", "GraphQL", "PostgreSQL", "DevOps"],
-    experience: "Designed and scaled backend infrastructure for millions of users",
-    email: "bob.martinez@example.com",
-  },
-  {
-    id: "U003",
-    name: "Carol Williams",
-    title: "Product Manager",
-    organization: "Stripe",
-    summary: "Specialist in developer platforms and API products",
-    skills: ["Product Strategy", "Technical Communication", "Partnerships"],
-    experience: "Launched multiple developer-facing products",
-    email: "carol.williams@example.com",
-  },
-  {
-    id: "U004",
-    name: "Diego Rodriguez",
-    title: "Data Scientist",
-    organization: "OpenAI",
-    summary: "Expert in large language models and prompt engineering",
-    skills: ["LLMs", "Prompt Engineering", "Python", "ML Ops"],
-    experience: "Worked on scaling LLM inference and optimization",
-    email: "diego.rodriguez@example.com",
-  },
-  {
-    id: "U005",
-    name: "Emma Thompson",
-    title: "DevOps Engineer",
-    organization: "AWS",
-    summary: "Infrastructure and deployment automation specialist",
-    skills: ["Kubernetes", "Docker", "AWS", "Terraform", "CI/CD"],
-    experience: "Managed infrastructure for enterprise-scale applications",
-    email: "emma.thompson@example.com",
-  },
-  {
-    id: "U006",
-    name: "Frank Johnson",
-    title: "Frontend Engineer",
-    organization: "Vercel",
-    summary: "Expert in React, performance optimization, and UX",
-    skills: ["React", "TypeScript", "Next.js", "Performance Tuning"],
-    experience: "Built high-performance web applications used by millions",
-    email: "frank.johnson@example.com",
-  },
-  {
-    id: "U007",
-    name: "Grace Lee",
-    title: "Security Engineer",
-    organization: "Cloudflare",
-    summary: "Specialist in authentication, encryption, and security architecture",
-    skills: ["Security", "Cryptography", "Authentication", "Zero Trust"],
-    experience: "Implemented security protocols for global-scale systems",
-    email: "grace.lee@example.com",
-  },
-  {
-    id: "U008",
-    name: "Hassan Patel",
-    title: "ML Ops Engineer",
-    organization: "Databricks",
-    summary: "Expert in ML infrastructure and production systems",
-    skills: ["ML Ops", "Spark", "Ray", "Model Serving", "Monitoring"],
-    experience: "Scaled ML pipelines to handle petabyte-scale datasets",
-    email: "hassan.patel@example.com",
-  },
-  {
-    id: "U009",
-    name: "Iris Chen",
-    title: "Solutions Architect",
-    organization: "Microsoft",
-    summary: "Enterprise system design and integration specialist",
-    skills: ["System Design", "Enterprise Architecture", "Cloud"],
-    experience: "Designed solutions for Fortune 500 companies",
-    email: "iris.chen@example.com",
-  },
-  {
-    id: "U010",
-    name: "James Wilson",
-    title: "Founding Engineer",
-    organization: "Anthropic",
-    summary: "AI systems and safety researcher",
-    skills: ["AI Safety", "System Design", "Research", "RLHF"],
-    experience: "Worked on fundamental AI research and safety problems",
-    email: "james.wilson@example.com",
-  },
-];
+interface SlackUser {
+  id: string;
+  real_name: string;
+  profile: {
+    email: string;
+    title?: string;
+    phone?: string;
+    skype?: string;
+    real_name: string;
+    real_name_normalized: string;
+    display_name: string;
+    display_name_normalized: string;
+    status_text?: string;
+    status_emoji?: string;
+    status_expiration?: number;
+    avatar_hash: string;
+    image_24?: string;
+    image_32?: string;
+    image_48?: string;
+    image_72?: string;
+    image_192?: string;
+    image_512?: string;
+    team: string;
+  };
+}
 
-export function getAllContacts(): Contact[] {
-  return CONTACTS;
+interface SlackUsersListResponse {
+  ok: boolean;
+  members: SlackUser[];
+  response_metadata?: {
+    next_cursor?: string;
+  };
+}
+
+interface SlackUserInfoResponse {
+  ok: boolean;
+  user: SlackUser;
+}
+
+let contactsCache: Contact[] | null = null;
+let cacheTimestamp: number = 0;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+async function fetchSlackUsers(): Promise<SlackUser[]> {
+  const botToken = process.env.SLACK_BOT_TOKEN;
+  if (!botToken) {
+    throw new Error("SLACK_BOT_TOKEN is not configured");
+  }
+
+  const response = await fetch("https://slack.com/api/users.list", {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${botToken}`,
+    },
+  });
+
+  const data = (await response.json()) as SlackUsersListResponse;
+
+  if (!data.ok) {
+    throw new Error(`Slack API error: ${data}`);
+  }
+
+  return data.members;
+}
+
+function transformSlackUserToContact(user: SlackUser): Contact {
+  const profile = user.profile;
+
+  return {
+    id: user.id,
+    name: profile.real_name || profile.display_name || "Unknown",
+    title: profile.title || "Slack User",
+    organization: "Workspace", // Slack doesn't provide org in free tier
+    summary: profile.status_text || undefined,
+    email: profile.email || "",
+    avatar: profile.image_192,
+    // Skills are not available in base Slack profiles
+    // Could be extracted from status_text or title if formatted correctly
+    skills: extractSkillsFromProfile(profile),
+    experience: undefined, // Not available in Slack profiles
+  };
+}
+
+function extractSkillsFromProfile(
+  profile: SlackUser["profile"]
+): string[] | undefined {
+  const skills: string[] = [];
+
+  // Try to extract skills from title
+  const titleKeywords = [
+    "engineer",
+    "developer",
+    "designer",
+    "manager",
+    "analyst",
+    "scientist",
+    "architect",
+    "lead",
+    "senior",
+    "junior",
+  ];
+
+  if (profile.title) {
+    const titleLower = profile.title.toLowerCase();
+    titleKeywords.forEach((kw) => {
+      if (titleLower.includes(kw)) {
+        skills.push(kw);
+      }
+    });
+  }
+
+  // Try to extract from status
+  if (profile.status_text) {
+    const statusLower = profile.status_text.toLowerCase();
+    const techKeywords = [
+      "python",
+      "javascript",
+      "typescript",
+      "react",
+      "golang",
+      "rust",
+      "java",
+      "aws",
+      "gcp",
+      "kubernetes",
+      "docker",
+      "ml",
+      "ai",
+      "data",
+      "backend",
+      "frontend",
+      "fullstack",
+    ];
+    techKeywords.forEach((kw) => {
+      if (statusLower.includes(kw)) {
+        skills.push(kw);
+      }
+    });
+  }
+
+  return skills.length > 0 ? skills : undefined;
+}
+
+export async function getAllContacts(): Promise<Contact[]> {
+  // Return cached contacts if still fresh
+  if (contactsCache && Date.now() - cacheTimestamp < CACHE_DURATION) {
+    return contactsCache;
+  }
+
+  try {
+    const slackUsers = await fetchSlackUsers();
+
+    // Filter out bots and inactive users
+    const activeUsers = slackUsers.filter((user) => {
+      const isBot = user.profile.display_name === "bot" || user.id.startsWith("B");
+      const hasEmail = !!user.profile.email;
+      return !isBot && hasEmail;
+    });
+
+    contactsCache = activeUsers.map(transformSlackUserToContact);
+    cacheTimestamp = Date.now();
+
+    return contactsCache;
+  } catch (error) {
+    console.error("Failed to fetch Slack contacts:", error);
+    // Return empty array on error (bot will handle gracefully)
+    return [];
+  }
 }
 
 export function getContactById(id: string): Contact | undefined {
-  return CONTACTS.find((c) => c.id === id);
+  if (!contactsCache) {
+    return undefined;
+  }
+  return contactsCache.find((c) => c.id === id);
 }
 
-export function filterContactsBySkills(skills: string[], threshold = 1): Contact[] {
-  return CONTACTS.filter((contact) => {
+export function filterContactsBySkills(
+  skills: string[],
+  threshold = 1
+): Contact[] {
+  if (!contactsCache) {
+    return [];
+  }
+
+  return contactsCache.filter((contact) => {
     if (!contact.skills) return false;
     const matchCount = skills.filter((skill) =>
-      contact.skills?.some((s) =>
-        s.toLowerCase().includes(skill.toLowerCase()) ||
-        skill.toLowerCase().includes(s.toLowerCase())
+      contact.skills?.some(
+        (s) =>
+          s.toLowerCase().includes(skill.toLowerCase()) ||
+          skill.toLowerCase().includes(s.toLowerCase())
       )
     ).length;
     return matchCount >= threshold;
@@ -139,6 +213,10 @@ export function filterContactsBySkills(skills: string[], threshold = 1): Contact
 }
 
 export function filterContactsByDomain(domain: string): Contact[] {
+  if (!contactsCache) {
+    return [];
+  }
+
   const domainKeywords = {
     ml: ["ML", "AI", "Machine Learning", "LLM", "Neural", "Data Science"],
     backend: ["Backend", "API", "Database", "Server", "Infrastructure", "DevOps"],
@@ -150,7 +228,7 @@ export function filterContactsByDomain(domain: string): Contact[] {
 
   const keywords = domainKeywords[domain as keyof typeof domainKeywords] || [];
 
-  return CONTACTS.filter((contact) => {
+  return contactsCache.filter((contact) => {
     const text = `${contact.title} ${contact.skills?.join(" ") || ""}`.toLowerCase();
     return keywords.some((kw) => text.includes(kw.toLowerCase()));
   });
