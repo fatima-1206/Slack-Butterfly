@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { after } from "next/server";
 import { analyzeConversation, analyzeRecommendationFeedback, rankContacts } from "@/lib/llm";
 import {
   getConversation,
@@ -91,17 +92,54 @@ function verifySlackSignature(request: Request, rawBody: string): boolean {
   }
   const signature = request.headers.get(SLACK_SIGNATURE_HEADER);
   const timestamp = request.headers.get(SLACK_TIMESTAMP_HEADER);
-  if (!signature || !timestamp) return false;
+  if (!signature || !timestamp) {
+    console.warn("[Route] Signature verification failed: missing signature or timestamp header", {
+      hasSignature: Boolean(signature),
+      hasTimestamp: Boolean(timestamp),
+    });
+    return false;
+  }
   const timestampNumber = Number(timestamp);
-  if (!Number.isFinite(timestampNumber)) return false;
+  if (!Number.isFinite(timestampNumber)) {
+    console.warn("[Route] Signature verification failed: invalid timestamp header", {
+      timestamp,
+    });
+    return false;
+  }
   const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - timestampNumber) > MAX_REQUEST_AGE_SECONDS) return false;
+  const ageSeconds = Math.abs(now - timestampNumber);
+  if (ageSeconds > MAX_REQUEST_AGE_SECONDS) {
+    console.warn("[Route] Signature verification failed: timestamp outside tolerance", {
+      timestamp,
+      now,
+      ageSeconds,
+      maxAgeSeconds: MAX_REQUEST_AGE_SECONDS,
+    });
+    return false;
+  }
   const basestring = `v0:${timestamp}:${rawBody}`;
   const expectedSignature = `v0=${createHmac("sha256", signingSecret).update(basestring).digest("hex")}`;
   const signatureBuffer = Buffer.from(signature);
   const expectedBuffer = Buffer.from(expectedSignature);
-  if (signatureBuffer.length !== expectedBuffer.length) return false;
-  return timingSafeEqual(signatureBuffer, expectedBuffer);
+  if (signatureBuffer.length !== expectedBuffer.length) {
+    console.warn("[Route] Signature verification failed: signature length mismatch", {
+      receivedLength: signatureBuffer.length,
+      expectedLength: expectedBuffer.length,
+      receivedPrefix: signature.slice(0, 6),
+    });
+    return false;
+  }
+
+  const isValid = timingSafeEqual(signatureBuffer, expectedBuffer);
+  if (!isValid) {
+    console.warn("[Route] Signature verification failed: digest mismatch", {
+      receivedPrefix: signature.slice(0, 10),
+      expectedPrefix: expectedSignature.slice(0, 10),
+      timestamp,
+    });
+  }
+
+  return isValid;
 }
 
 function parseSlackPayload(rawBody: string, contentType: string | null): SlackPayload | null {
@@ -421,8 +459,12 @@ export async function POST(request: Request) {
     const command = action.value || action.action_id.replace("command_", "");
     console.log(`[Route] Button click from ${userId}: ${command}`);
 
-    processUserMessage(workspaceId, userId, command, channelId).catch((error) => {
-      console.error("[Route] Background processing error for interactive action:", error);
+    after(async () => {
+      try {
+        await processUserMessage(workspaceId, userId, command, channelId);
+      } catch (error) {
+        console.error("[Route] Background processing error for interactive action:", error);
+      }
     });
 
     return Response.json({ ok: true });
@@ -470,9 +512,14 @@ export async function POST(request: Request) {
 
       console.log(`[Route] Processing DM from ${userId}: "${userMessage.substring(0, 50)}..."`);
 
-      // Process async, but respond to Slack immediately
-      processUserMessage(workspaceId, userId, userMessage, channelId).catch((error) => {
-        console.error("[Route] Background processing error:", error);
+      // Schedule processing after response so Slack gets a fast ack,
+      // while Vercel keeps execution alive for post-response work.
+      after(async () => {
+        try {
+          await processUserMessage(workspaceId, userId, userMessage, channelId);
+        } catch (error) {
+          console.error("[Route] Background processing error:", error);
+        }
       });
 
       // Return 200 OK immediately to acknowledge receipt
