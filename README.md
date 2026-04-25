@@ -203,17 +203,47 @@ npm run build
 npm run start
 ```
 
-2. Use ngrok or similar to expose your local server for Slack events:
+2. Set up your environment variables:
+
+- Copy [sample.env](sample.env) to a local [.env](.env) file and fill in real values.
+- Keep this file local only. Do not commit secrets.
+
+Required variables by category:
+
+- Slack app/auth:
+  - `SLACK_SIGNING_SECRET`
+  - `SLACK_BOT_TOKEN` (single workspace)
+  - `SLACK_BOT_TOKEN_MAP` (multi-workspace map, optional)
+  - `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_REDIRECT_URI` (for OAuth)
+- LLM providers:
+  - `PRODUCTION_MODEL` (default is `openai/gpt-4o`)
+  - `PRODUCTION_MODEL_TOKEN` or `GITHUB_TOKEN` (GitHub Models)
+  - `DEVELOPMENT_MODEL` (default is Groq model)
+  - `DEVELOPMENT_MODEL_TOKEN` or `GROQ_API_KEY`/`GROQ_TOKEN` (Groq)
+- Search/enrichment:
+  - `TAVILY_API_KEY`
+- Firebase:
+  - `FIREBASE_SERVICE_ACCOUNT_KEY` (service account JSON, typically base64 encoded in one line)
+
+3. If running locally, use ngrok or similar to expose your server for Slack events:
 
 ```bash
 ngrok http 3000
 ```
 
-3. Create a Slack app with permissions for reading messages and user profiles. Set the event subscription URL to your ngrok URL + `/api/slack/events`.
+4. Update your Slack app manifest request URLs.
 
-4. Set environment variables for Slack tokens, LLM API keys, and Firestore credentials.
+- In [slack-butterfly-manifest.json](slack-butterfly-manifest.json), replace both of these with your current deployment URL:
+  - `settings.interactivity.request_url`
+  - `settings.event_subscriptions.request_url`
+- For local development, set both to your tunnel URL, for example:
+  - `https://YOUR-NGROK-ID.ngrok-free.app/api/slack/events`
+- For production, set them to your Vercel URL:
+  - `https://YOUR-PROJECT.vercel.app/api/slack/events`
 
-5. Start chatting with the bot in Slack and watch the conversation state evolve in Firestore!
+5. Create/update your Slack app with the manifest and ensure bot scopes include message permissions for IMs.
+
+6. Start chatting with the bot in Slack and watch conversation and contact data update in Firestore.
 
 ## Future Improvements
 
@@ -224,7 +254,6 @@ ngrok http 3000
 - Implementing a more sophisticated ranking algorithm that takes into account not just relevance but also factors like the contact's availability, past interactions with the user, and mutual connections.
 
 - Organizations may be able to provide access to data such as the resumes of their employees, which would allow for much richer profiles and more accurate recommendations. If such data were available, the agent could be designed to leverage it effectively while ensuring privacy and security considerations are met.
-
 
 - Improve response latency by optimizing LLM prompts, caching results, and parallelizing data retrieval.
 
