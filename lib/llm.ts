@@ -368,7 +368,7 @@ export async function callLLM(messages: LLMMessage[], temperature = 0.7, maxToke
       continue;
     }
 
-    const maxAttempts = providerConfig.provider === primaryConfig.provider ? 2 : 1;
+    const maxAttempts = providerConfig.provider === primaryConfig.provider ? 1 : 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         if (providerConfig.provider !== primaryConfig.provider) {
