@@ -39,7 +39,29 @@ type SlackEventCallbackPayload = {
   event: SlackMessageEvent;
 };
 
-type SlackPayload = SlackUrlVerificationPayload | SlackEventCallbackPayload;
+type SlackInteractiveAction = {
+  action_id: string;
+  value?: string;
+};
+
+type SlackBlockActionsPayload = {
+  type: "block_actions";
+  team: {
+    id: string;
+  };
+  user: {
+    id: string;
+  };
+  channel?: {
+    id: string;
+  };
+  container?: {
+    channel_id?: string;
+  };
+  actions: SlackInteractiveAction[];
+};
+
+type SlackPayload = SlackUrlVerificationPayload | SlackEventCallbackPayload | SlackBlockActionsPayload;
 
 const SLACK_SIGNATURE_HEADER = "x-slack-signature";
 const SLACK_TIMESTAMP_HEADER = "x-slack-request-timestamp";
@@ -80,6 +102,20 @@ function verifySlackSignature(request: Request, rawBody: string): boolean {
   const expectedBuffer = Buffer.from(expectedSignature);
   if (signatureBuffer.length !== expectedBuffer.length) return false;
   return timingSafeEqual(signatureBuffer, expectedBuffer);
+}
+
+function parseSlackPayload(rawBody: string, contentType: string | null): SlackPayload | null {
+  if (contentType?.includes("application/x-www-form-urlencoded") || rawBody.startsWith("payload=")) {
+    const params = new URLSearchParams(rawBody);
+    const payloadValue = params.get("payload");
+    if (!payloadValue) {
+      return null;
+    }
+
+    return JSON.parse(payloadValue) as SlackPayload;
+  }
+
+  return JSON.parse(rawBody) as SlackPayload;
 }
 
 async function getUserProfile(workspaceId: string, userId: string): Promise<UserProfile | null> {
@@ -161,7 +197,56 @@ function formatProblemSummary(problemState: ProblemState): string {
   return lines.join("\n");
 }
 
-async function postDmReply(workspaceId: string, channel: string, text: string): Promise<void> {
+function buildCommandButtons() {
+  return [
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Status" },
+          action_id: "command_status",
+          value: "status",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Help" },
+          action_id: "command_help",
+          value: "help",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Reset" },
+          action_id: "command_reset",
+          value: "reset",
+        },
+      ],
+    },
+  ];
+}
+
+function buildReplyBlocks(text: string) {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text,
+      },
+    },
+    {
+      type: "divider",
+    },
+    ...buildCommandButtons(),
+  ];
+}
+
+async function postDmReply(
+  workspaceId: string,
+  channel: string,
+  text: string,
+  includeButtons = false
+): Promise<void> {
   const botToken = getBotToken(workspaceId);
   if (!botToken) {
     console.warn(`[Slack] No bot token configured for workspace ${workspaceId}.`);
@@ -179,6 +264,7 @@ async function postDmReply(workspaceId: string, channel: string, text: string): 
     body: JSON.stringify({
       channel,
       text,
+      ...(includeButtons ? { blocks: buildReplyBlocks(text) } : {}),
     }),
   });
 
@@ -204,6 +290,7 @@ export async function POST(request: Request) {
   console.log("[Route] Incoming Slack event");
 
   const rawBody = await request.text();
+  const contentType = request.headers.get("content-type");
 
   if (!verifySlackSignature(request, rawBody)) {
     console.warn("[Route] Invalid signature");
@@ -212,7 +299,11 @@ export async function POST(request: Request) {
 
   let payload: SlackPayload;
   try {
-    payload = JSON.parse(rawBody) as SlackPayload;
+    const parsedPayload = parseSlackPayload(rawBody, contentType);
+    if (!parsedPayload) {
+      throw new Error("Unable to parse Slack payload");
+    }
+    payload = parsedPayload;
   } catch (error) {
     console.error("[Route] Invalid JSON payload:", error);
     return Response.json({ ok: false, error: "invalid_json" }, { status: 400 });
@@ -221,6 +312,27 @@ export async function POST(request: Request) {
   if (payload.type === "url_verification") {
     console.log("[Route] URL verification challenge");
     return Response.json({ challenge: payload.challenge });
+  }
+
+  if (payload.type === "block_actions") {
+    const workspaceId = payload.team.id;
+    const userId = payload.user.id;
+    const channelId = payload.channel?.id || payload.container?.channel_id;
+    const action = payload.actions[0];
+
+    if (!channelId || !action) {
+      console.error("[Route] Missing channel or action in block_actions payload");
+      return Response.json({ ok: false, error: "invalid_interactive_payload" }, { status: 400 });
+    }
+
+    const command = action.value || action.action_id.replace("command_", "");
+    console.log(`[Route] Button click from ${userId}: ${command}`);
+
+    processUserMessage(workspaceId, userId, command, channelId).catch((error) => {
+      console.error("[Route] Background processing error for interactive action:", error);
+    });
+
+    return Response.json({ ok: true });
   }
 
   if (payload.type === "event_callback") {
@@ -324,7 +436,7 @@ async function processUserMessage(
     if (commandMatch === "help") {
       console.log(`[Process] Handling 'help' command for user ${userId}`);
       const helpText = `*Available commands:*\n• *status* or *show problem* - See my understanding of your problem\n• *reset* - Start over with a new problem\n• *help* - Show this message\n\n*How to use me:*\n1. Describe a problem you need help solving\n2. I'll ask clarifying questions to understand better\n3. Once I have enough context, I'll recommend people who can help\n4. Feedback helps me refine: "more backend people" or "that person isn't relevant"`;
-      await postDmReply(workspaceId, channelId, helpText);
+      await postDmReply(workspaceId, channelId, helpText, true);
       return;
     }
 
@@ -358,8 +470,10 @@ async function processUserMessage(
 
     // Determine the response
     let botResponse: string;
+    let showCommandButtons = false;
 
     if (analysis.nextAction === "ready_to_recommend" || analysis.nextAction === "refine") {
+      showCommandButtons = true;
       console.log(`[Process] Entering recommendation mode${analysis.nextAction === "refine" ? " (refinement)" : ""}`);
       // We have enough info to recommend contacts
       console.log(`[Process] Fetching contacts from Slack`);
@@ -391,8 +505,8 @@ async function processUserMessage(
             const contact = contactsById.get(rec.contactId);
             const displayName = contact?.name || rec.contactId;
             const displayTitle = contact?.title ? ` (${contact.title})` : "";
-            const askLine = rec.suggestedAsk ? `\n   Ask them: "${rec.suggestedAsk}"` : "";
-            return `${idx + 1}. *${displayName}*${displayTitle} - ${rec.why}\n   Score: ${(rec.score * 100).toFixed(0)}%${askLine}`;
+            const askLine = rec.suggestedAsk ? `\n   *Ask them:* "${rec.suggestedAsk}"` : "";
+            return `${idx + 1}. *${displayName}*${displayTitle} - ${rec.why}\n   *Score:* ${(rec.score * 100).toFixed(0)}%${askLine}`;
           })
           .join("\n\n");
 
@@ -452,7 +566,7 @@ async function processUserMessage(
 
     console.log(`[Process] Sending response to Slack (length: ${botResponse.length})`);
     // Send response to user
-    await postDmReply(workspaceId, channelId, botResponse);
+    await postDmReply(workspaceId, channelId, botResponse, showCommandButtons);
     console.log(`[Process] Completed successfully for user ${userId}`);
   } catch (error) {
     console.error("[Process] Error processing message:", error);
