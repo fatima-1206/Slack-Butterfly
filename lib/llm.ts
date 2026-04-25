@@ -75,6 +75,7 @@ type LLMConfig = {
   model: string;
   token?: string;
   endpoint?: string;
+  tokenName?: string;
 };
 
 function normalizeStringArray(value: unknown): string[] {
@@ -240,20 +241,24 @@ function getLLMProvider(): LLMProvider {
 
 function getProviderConfig(provider: LLMProvider): LLMConfig {
   if (provider === "github") {
+    const productionToken = process.env.PRODUCTION_MODEL_TOKEN || process.env.GITHUB_TOKEN;
     console.log("Using GitHub GPT-4 model for LLM interactions");
     return {
       provider: "github" as const,
       model: process.env.PRODUCTION_MODEL || "openai/gpt-4o",
-      token: process.env.PRODUCTION_MODEL_TOKEN,
+      token: productionToken,
       endpoint: "https://models.github.ai/inference",
+      tokenName: process.env.PRODUCTION_MODEL_TOKEN ? "PRODUCTION_MODEL_TOKEN" : process.env.GITHUB_TOKEN ? "GITHUB_TOKEN" : undefined,
     };
   }
 
   console.log("Using Groq model for LLM interactions");
+  const developmentToken = process.env.DEVELOPMENT_MODEL_TOKEN || process.env.GROQ_API_KEY || process.env.GROQ_TOKEN;
   return {
     provider: "groq" as const,
     model: process.env.DEVELOPMENT_MODEL || "llama-3.3-70b-versatile",
-    token: process.env.DEVELOPMENT_MODEL_TOKEN,
+    token: developmentToken,
+    tokenName: process.env.DEVELOPMENT_MODEL_TOKEN ? "DEVELOPMENT_MODEL_TOKEN" : process.env.GROQ_API_KEY ? "GROQ_API_KEY" : process.env.GROQ_TOKEN ? "GROQ_TOKEN" : undefined,
   };
 }
 
@@ -364,7 +369,9 @@ export async function callLLM(messages: LLMMessage[], temperature = 0.7, maxToke
 
   for (const providerConfig of providers) {
     if (!providerConfig.token) {
-      console.warn(`[LLM] Skipping ${providerConfig.provider}: token not configured`);
+      console.warn(
+        `[LLM] Skipping ${providerConfig.provider}: token not configured (${providerConfig.provider === "github" ? "set PRODUCTION_MODEL_TOKEN or GITHUB_TOKEN" : "set DEVELOPMENT_MODEL_TOKEN, GROQ_API_KEY, or GROQ_TOKEN"})`
+      );
       continue;
     }
 
