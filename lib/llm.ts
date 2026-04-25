@@ -78,6 +78,8 @@ type LLMConfig = {
   tokenName?: string;
 };
 
+const LLM_REQUEST_TIMEOUT_MS = 20_000;
+
 function normalizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -296,6 +298,24 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeoutId: NodeJS.Timeout | null = null;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
 async function callProvider(
   config: LLMConfig,
   messages: LLMMessage[],
@@ -381,7 +401,11 @@ export async function callLLM(messages: LLMMessage[], temperature = 0.7, maxToke
         if (providerConfig.provider !== primaryConfig.provider) {
           console.warn(`[LLM] Falling back to ${providerConfig.provider} provider`);
         }
-        return await callProvider(providerConfig, messages, temperature, maxTokens);
+        return await withTimeout(
+          callProvider(providerConfig, messages, temperature, maxTokens),
+          LLM_REQUEST_TIMEOUT_MS,
+          `[LLM] ${providerConfig.provider}`
+        );
       } catch (error) {
         lastError = error;
         const transient = isTransientLLMError(error);

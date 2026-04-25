@@ -16,7 +16,7 @@ export async function POST(request: Request) {
 
     console.log("[Admin] Triggering contact refresh...");
     
-    const contacts = await getAllContacts(workspaceId);
+    const contacts = await getAllContacts(workspaceId, { allowEnrichment: true });
     
     console.log(`[Admin] Successfully fetched and cached ${contacts.length} contacts`);
     

@@ -80,6 +80,8 @@ const CONTACTS_COLLECTION = "contacts";
 const ENRICHMENT_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_ENRICHMENT_RETRIES = 3;
 const TAVILY_BATCH_DELAY = 500; // 500ms between requests to avoid rate limits
+const TAVILY_FETCH_TIMEOUT_MS = 6000;
+const SLACK_FETCH_TIMEOUT_MS = 8000;
 
 const contactsCacheByWorkspace: Map<string, Contact[]> = new Map();
 const cacheTimestampByWorkspace: Map<string, number> = new Map();
@@ -263,6 +265,9 @@ async function enrichContactWithTavily(contact: Contact): Promise<TavilyEnrichme
   }
 
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), TAVILY_FETCH_TIMEOUT_MS);
+
     const payload = {
       api_key: tavilyKey,
       query: buildTavilyQuery(contact),
@@ -274,7 +279,9 @@ async function enrichContactWithTavily(contact: Contact): Promise<TavilyEnrichme
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
 
     if (!response.ok) {
       console.warn(
@@ -561,7 +568,16 @@ async function saveContactsToFirestore(workspaceId: string, contacts: Contact[])
   }
 }
 
-export async function getAllContacts(workspaceId: string): Promise<Contact[]> {
+type GetAllContactsOptions = {
+  allowEnrichment?: boolean;
+};
+
+export async function getAllContacts(
+  workspaceId: string,
+  options: GetAllContactsOptions = {}
+): Promise<Contact[]> {
+  const { allowEnrichment = false } = options;
+
   // Return cached contacts if still fresh for this workspace
   const wsCache = contactsCacheByWorkspace.get(workspaceId);
   const wsTimestamp = cacheTimestampByWorkspace.get(workspaceId);
@@ -608,9 +624,13 @@ export async function getAllContacts(workspaceId: string): Promise<Contact[]> {
       })
       .filter((contact) => !isSystemContact(contact));
 
-    // Enrich contacts with Tavily (async, non-blocking for cache)
-    console.log(`[Enrichment] Starting enrichment for ${contacts.length} contacts...`);
-    contacts = await enrichContactsBatch(contacts);
+    if (allowEnrichment) {
+      // Enrichment is expensive; keep it off the user-message path.
+      console.log(`[Enrichment] Starting enrichment for ${contacts.length} contacts...`);
+      contacts = await enrichContactsBatch(contacts);
+    } else {
+      console.log("[Enrichment] Skipped for latency-sensitive request");
+    }
 
     // Update workspace cache
     contactsCacheByWorkspace.set(workspaceId, contacts);
@@ -688,12 +708,17 @@ async function fetchSlackUsers(workspaceId: string): Promise<SlackUser[]> {
     throw new Error(`Slack bot token is not configured for workspace ${workspaceId}`);
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SLACK_FETCH_TIMEOUT_MS);
+
   const response = await fetch("https://slack.com/api/users.list", {
     method: "GET",
     headers: {
       Authorization: `Bearer ${botToken}`,
     },
+    signal: controller.signal,
   });
+  clearTimeout(timeout);
 
   const data = (await response.json()) as SlackUsersListResponse;
 
