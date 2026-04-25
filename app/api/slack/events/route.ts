@@ -178,23 +178,116 @@ async function getUserProfile(workspaceId: string, userId: string): Promise<User
   }
 }
 
-function formatProblemSummary(problemState: ProblemState): string {
-  const lines = [
-    `*Problem Summary:*`,
-    `• Type: ${problemState.problemType || "Not specified"}`,
-    `• Summary: ${problemState.summary}`,
-    `• Key Needs: ${problemState.keyNeeds?.join(", ") || "None"}`,
-  ];
-  if (problemState.constraints?.length) {
-    lines.push(`• Constraints: ${problemState.constraints.join(", ")}`);
+function toIsoDate(value: unknown): string {
+  if (!value) {
+    return "unknown";
   }
-  if (problemState.urgency) {
-    lines.push(`• Urgency: ${problemState.urgency}`);
+
+  if (value instanceof Date) {
+    return value.toISOString();
   }
-  if (problemState.domain) {
-    lines.push(`• Domain: ${problemState.domain}`);
+
+  if (typeof value === "object" && value !== null && "toDate" in value) {
+    try {
+      // Call as a method on the original object so Firestore Timestamp keeps its `this` binding.
+      const converted = (value as { toDate: () => Date }).toDate();
+      if (converted instanceof Date && !Number.isNaN(converted.getTime())) {
+        return converted.toISOString();
+      }
+    } catch {
+      // Fall through to other parsing strategies below.
+    }
   }
-  return lines.join("\n");
+
+  if (typeof value === "string" || typeof value === "number") {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+
+  return "unknown";
+}
+
+function summarizeConfidence(confidence: number): "unclear" | "clarifying" | "executing" {
+  if (confidence < 0.3) {
+    return "unclear";
+  }
+  if (confidence < 0.7) {
+    return "clarifying";
+  }
+  return "executing";
+}
+
+function formatDetailedStatus(conversation: {
+  problemState: ProblemState;
+  confidence: number;
+  state: string;
+  version: number;
+  lastUpdated: unknown;
+  messages: Array<{ role: "user" | "assistant"; content: string; timestamp?: number }>;
+}): string {
+  const problemState = conversation.problemState;
+  const requiredFields = {
+    problemType: !!problemState.problemType?.trim(),
+    summary: !!problemState.summary?.trim(),
+    keyNeeds: (problemState.keyNeeds?.length || 0) > 0,
+  };
+  const requiredComplete = Object.values(requiredFields).every(Boolean);
+  const missingRequired = Object.entries(requiredFields)
+    .filter(([, complete]) => !complete)
+    .map(([field]) => field);
+
+  const confidencePercent = (conversation.confidence * 100).toFixed(0);
+  const confidenceBand = summarizeConfidence(conversation.confidence);
+  const recentMessages = conversation.messages.slice(-4);
+
+  const contextPreview =
+    recentMessages.length === 0
+      ? "• No messages yet"
+      : recentMessages
+          .map((message) => {
+            const label = message.role === "user" ? "User" : "Bot";
+            const clipped = message.content.length > 140
+              ? `${message.content.slice(0, 137)}...`
+              : message.content;
+            return `• ${label}: ${clipped}`;
+          })
+          .join("\n");
+
+  const optionalFields = [
+    `• Constraints: ${problemState.constraints?.length ? problemState.constraints.join(", ") : "none"}`,
+    `• Urgency: ${problemState.urgency || "unspecified"}`,
+    `• Domain: ${problemState.domain || "unspecified"}`,
+  ].join("\n");
+
+  return [
+    "*Detailed Problem State*",
+    "",
+    "*Structured Problem*",
+    `• Type: ${problemState.problemType || "unspecified"}`,
+    `• Summary: ${problemState.summary || "unspecified"}`,
+    `• Key Needs: ${problemState.keyNeeds?.length ? problemState.keyNeeds.join(", ") : "none"}`,
+    optionalFields,
+    "",
+    "*Completeness Check (required fields)*",
+    `• problemType: ${requiredFields.problemType ? "complete" : "missing"}`,
+    `• summary: ${requiredFields.summary ? "complete" : "missing"}`,
+    `• keyNeeds: ${requiredFields.keyNeeds ? "complete" : "missing"}`,
+    `• Required complete: ${requiredComplete ? "yes" : `no (${missingRequired.join(", ")})`}`,
+    "",
+    "*Reasoning Confidence*",
+    `• Confidence: ${confidencePercent}% (${confidenceBand})`,
+    `• Conversation state: ${conversation.state}`,
+    "",
+    "*Conversation Telemetry*",
+    `• Messages: ${conversation.messages.length}`,
+    `• Version: ${conversation.version}`,
+    `• Last updated: ${toIsoDate(conversation.lastUpdated)}`,
+    "",
+    "*Recent Context Snapshot*",
+    contextPreview,
+  ].join("\n");
 }
 
 function buildCommandButtons() {
@@ -427,7 +520,7 @@ async function processUserMessage(
       } else if (!conversation.problemState || !conversation.problemState.summary) {
         await postDmReply(workspaceId, channelId, "I haven't captured a problem statement yet. Share more about what you need help with.");
       } else {
-        const statusMsg = `${formatProblemSummary(conversation.problemState)}\n\nConfidence: ${(conversation.confidence * 100).toFixed(0)}% | Messages: ${conversation.messages.length} | State: ${conversation.state}`;
+        const statusMsg = formatDetailedStatus(conversation);
         await postDmReply(workspaceId, channelId, statusMsg);
       }
       return;
