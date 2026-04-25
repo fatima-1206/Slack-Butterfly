@@ -1,6 +1,3 @@
-@AGENTS.md
-
-
 # Slack butterfly
 
 Build a Slack bot that acts as an intelligent co-pilot for surfacing the right people to solve a problem. The agent should:
