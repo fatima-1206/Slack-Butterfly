@@ -9,113 +9,88 @@
 [![OpenAI](https://img.shields.io/badge/OpenAI-412991?logo=openai&logoColor=white)](https://openai.com)
 [![Tavily](https://img.shields.io/badge/Tavily-000000?logo=tavily&logoColor=white)](https://tavily.com)
 
-A Slack bot that finds the right people in your workspace to solve a problem. Short conversation → structured problem state → ranked contact recommendations with reasoning.
 
-## How It Works
 
-1. **You describe a problem** in a DM
-2. **Bot asks 1–2 clarifying questions** until it has enough context
-3. **Bot recommends people** from your workspace with scores, reasoning, and a suggested ask
+<!-- state diagram: public/sb_statemachine.drawio.png -->
+<!-- flow diagram: public/sb_flowchart.drawio.png -->
 
-## Quick Demo
+Slack Butterfly is a Slack bot that helps you find the right people in your workspace to solve a problem.
 
-```
-You: We need help optimizing our NLP model for low-latency inference
+It does this by:
 
-Bot: Great! I found 2 people who might help:
+- asking a few targeted questions
+- maintaining a structured problem state
+- matching that state against available contacts
+- returning a short, ranked list with reasoning
 
-1. *Alice Chen* (ML Engineer) — Built transformer-based NLP pipelines
-   Score: 87% | Ask: "Can you share your experience optimizing
-   transformer models for low-latency inference?"
+The system is stateful — each message updates its understanding instead of starting from scratch.
 
-2. *Diego Rodriguez* (Data Scientist) — Specializes in model compression
-   Score: 72% | Ask: "What quantization approaches have you found
-   most effective for NLP models in production?"
-```
 
 ## Architecture
 
+<!-- architecture diagram: public/SlackButterflyArchitecture.png -->
+<img src="public/SlackButterflyArchitecture.png" alt="architecture diagram" width="600">
+
+The system is split into four layers:
+
+- **Interface** — Slack (DM-based interaction)
+- **Orchestration** — Next.js API route handling events
+- **Agent Logic**
+  - Conversation manager (history + state)
+  - LLM analyzer (structured extraction)
+  - Policy engine (clarify vs recommend)
+  - Recommendation engine (ranking + explanation)
+- **Data** — Firestore (conversation state, cached profiles)
+
+External services:
+
+- Slack API (events + user data)
+- LLM providers (Groq / OpenAI)
+- Tavily (optional enrichment)
+
+## Conversation Flow
+
+1. Message received from Slack  
+2. Conversation state loaded from Firestore  
+3. LLM extracts structured fields + confidence  
+4. Policy decides:
+   - ask a follow-up question  
+   - or generate recommendations  
+5. Response is sent and state is updated  
+
+
+## Agent Design
+
+The system operates in two modes:
+
+**Clarifying**
+
+- Triggered when required fields are missing or confidence is low
+- Asks specific follow-up questions
+
+**Recommending**
+
+- Triggered when the problem is sufficiently defined
+- Retrieves contacts, ranks them, and explains matches
+
+
+## Data Model
+
+Conversations are scoped per workspace and user:
+
 ```
-Slack DM → Slack Events API → Next.js API Route
-                                 ↓
-                    Firebase Firestore (state + cache)
-                                 ↓
-              LLM analyzes conversation & ranks contacts
-                                 ↓
-              Tavily enriches Slack profiles (skills, experience)
-                                 ↓
-                         Slack DM reply
+```
+Contacts are stored (or derived) separately:
+
+```
 ```
 
-**State machine:** confidence continuum `0.0–0.3` unclear → `0.3–0.7` clarifying → `0.7–1.0` recommending.
-
-**Ranking:** LLM scores skill match + experience, blended with heuristic validation. Low-confidence matches are dropped. Disclaimers shown when data is limited.
-
-## File Structure
-
-```
-app/api/slack/events/route.ts    # Webhook handler (events + buttons)
-lib/llm.ts                        # Conversation analysis + contact ranking
-lib/conversations.ts              # Firestore state management
-lib/contacts.ts                   # Slack users + Tavily enrichment
-lib/firebase.ts                   # Firebase Admin init
-```
 
 ## Setup
 
-### 1. Env Vars
+For usage (Slack workspace)
 
-```bash
-# Slack
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_SIGNING_SECRET=...
+- Create a Slack app at <https://api.slack.com/apps>
+- Go to App Manifest and paste the contents of `slack-butterfly-manifest.json` (file can be found in root directory)
 
-# LLM (dev = Groq, prod = GitHub Models GPT-4o)
-DEVELOPMENT_MODEL_TOKEN=...
-PRODUCTION_MODEL_TOKEN=...
-
-# Firebase (base64 service account JSON)
-FIREBASE_SERVICE_ACCOUNT_KEY=...
-
-# Optional enrichment
-TAVILY_API_KEY=tvly-...
-```
-
-### 2. Slack App
-
-1. Create app at [api.slack.com/apps](https://api.slack.com/apps)
-2. **Event Subscriptions** → URL: `/api/slack/events` → subscribe to `message.im`
-3. **Interactivity** → URL: `/api/slack/events`
-4. **OAuth Scopes:** `chat:write`, `users:read`, `users:read.email`
-5. Install to workspace
-
-### 3. Firebase
-
-Create project → enable Firestore → base64-encode service account key → paste into `FIREBASE_SERVICE_ACCOUNT_KEY`. See `FIREBASE_SETUP.md` for details.
-
-### 4. Run
-
-```bash
-npm install
-npm run dev        # localhost:3000/api/slack/events
-```
-
-Deploy to Vercel: `vercel --prod`
-
-## Commands
-
-| Command | Action |
-|---------|--------|
-| `help` | Show commands |
-| `status` | See current problem state |
-| `reset` | Start fresh |
-| *(anything else)* | Describe a problem |
-
-## What We'd Improve
-
-- **Feedback loop:** accept/reject buttons that refine future rankings
-- **Rich UI:** Block Kit cards with contact details and DM templates
-- **More enrichment:** GitHub, LinkedIn for deeper profiles
-- **Advanced reasoning:** availability, mutual connections, past interactions
-- **Team formation:** break big problems into sub-problems and recommend teams
 

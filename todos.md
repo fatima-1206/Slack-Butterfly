@@ -4,3 +4,4 @@ Implement a better UI.
 Add commands for the model. 
 what if two people ask for help at the same time?
 what if two workspaces install the bot and have overlapping users?
+make it cross check if it has the data of the right person from tavily and not just match the name.
