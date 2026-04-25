@@ -70,6 +70,13 @@ interface LLMResponse {
   };
 }
 
+type LLMConfig = {
+  provider: LLMProvider;
+  model: string;
+  token?: string;
+  endpoint?: string;
+};
+
 function normalizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -231,11 +238,8 @@ function getLLMProvider(): LLMProvider {
   return process.env.NODE_ENV === "production" ? "github" : "groq";
 }
 
-function getLLMConfig() {
-  const provider = getLLMProvider();
-
+function getProviderConfig(provider: LLMProvider): LLMConfig {
   if (provider === "github") {
-    console.log("Using GitHub GPT-4 model for LLM interactions");
     return {
       provider: "github" as const,
       model: process.env.PRODUCTION_MODEL || "openai/gpt-4o",
@@ -252,9 +256,46 @@ function getLLMConfig() {
   };
 }
 
-export async function callLLM(messages: LLMMessage[], temperature = 0.7, maxTokens = 1024): Promise<LLMResponse> {
-  const config = getLLMConfig();
+function getLLMConfig(): LLMConfig {
+  const provider = getLLMProvider();
+  const config = getProviderConfig(provider);
+  console.log(`Using ${provider === "github" ? "GitHub GPT-4" : "Groq"} model for LLM interactions`);
+  return config;
+}
 
+function getFallbackProvider(provider: LLMProvider): LLMProvider {
+  return provider === "github" ? "groq" : "github";
+}
+
+function isTransientLLMError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const status = "status" in error ? Number((error as { status?: unknown }).status) : NaN;
+  if ([408, 409, 429, 500, 502, 503, 504].includes(status)) {
+    return true;
+  }
+
+  const code = "code" in error ? String((error as { code?: unknown }).code || "") : "";
+  if (["ETIMEDOUT", "ECONNRESET", "EAI_AGAIN", "ENOTFOUND"].includes(code)) {
+    return true;
+  }
+
+  const message = "message" in error ? String((error as { message?: unknown }).message || "").toLowerCase() : "";
+  return message.includes("server had an error") || message.includes("temporarily") || message.includes("timeout");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function callProvider(
+  config: LLMConfig,
+  messages: LLMMessage[],
+  temperature: number,
+  maxTokens: number
+): Promise<LLMResponse> {
   if (!config.token) {
     throw new Error(`${config.provider.toUpperCase()} API token not configured`);
   }
@@ -286,32 +327,76 @@ export async function callLLM(messages: LLMMessage[], temperature = 0.7, maxToke
           }
         : undefined,
     };
-  } else {
-    // Groq provider
-    const client = new Groq({ apiKey: config.token });
-
-    const response = await client.chat.completions.create({
-      model: config.model,
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
-      temperature,
-      max_tokens: maxTokens,
-    });
-
-    const content = response.choices[0]?.message?.content || "";
-
-    return {
-      content,
-      usage: response.usage
-        ? {
-            promptTokens: response.usage.prompt_tokens,
-            completionTokens: response.usage.completion_tokens,
-          }
-        : undefined,
-    };
   }
+
+  const client = new Groq({ apiKey: config.token });
+
+  const response = await client.chat.completions.create({
+    model: config.model,
+    messages: messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    })),
+    temperature,
+    max_tokens: maxTokens,
+  });
+
+  const content = response.choices[0]?.message?.content || "";
+
+  return {
+    content,
+    usage: response.usage
+      ? {
+          promptTokens: response.usage.prompt_tokens,
+          completionTokens: response.usage.completion_tokens,
+        }
+      : undefined,
+  };
+}
+
+export async function callLLM(messages: LLMMessage[], temperature = 0.7, maxTokens = 1024): Promise<LLMResponse> {
+  const primaryConfig = getLLMConfig();
+  const fallbackConfig = getProviderConfig(getFallbackProvider(primaryConfig.provider));
+  const providers: LLMConfig[] = [primaryConfig, fallbackConfig];
+
+  let lastError: unknown;
+
+  for (const providerConfig of providers) {
+    if (!providerConfig.token) {
+      console.warn(`[LLM] Skipping ${providerConfig.provider}: token not configured`);
+      continue;
+    }
+
+    const maxAttempts = providerConfig.provider === primaryConfig.provider ? 2 : 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        if (providerConfig.provider !== primaryConfig.provider) {
+          console.warn(`[LLM] Falling back to ${providerConfig.provider} provider`);
+        }
+        return await callProvider(providerConfig, messages, temperature, maxTokens);
+      } catch (error) {
+        lastError = error;
+        const transient = isTransientLLMError(error);
+        const status =
+          error && typeof error === "object" && "status" in error
+            ? (error as { status?: unknown }).status
+            : "unknown";
+        console.error(
+          `[LLM] ${providerConfig.provider} attempt ${attempt}/${maxAttempts} failed (status=${String(status)}, transient=${transient})`
+        );
+
+        if (!transient || attempt === maxAttempts) {
+          break;
+        }
+
+        await sleep(350 * attempt);
+      }
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("LLM request failed after retries and provider fallback");
 }
 
 export async function analyzeConversation(
