@@ -44,7 +44,7 @@ This project uses a small set of tools that each have a specific role in the sys
 - **Slack** is the user-facing interface. The bot lives in DMs, which matches the problem-solving workflow and keeps the experience low-friction.
 - **Firestore / Firebase** stores conversation state and cached contact data. It was chosen because the app needs persistent, per-user state across messages and fast reads for repeated recommendations.
 - **Groq and OpenAI** provide the LLM layer. They are used for structured extraction and reasoning over the conversation, with the app able to switch providers depending on availability, latency, or quality tradeoffs.
-- **Tavily** is the optional enrichment source. It helps expand contact profiles without requiring the app to fetch and process everything on every request.
+- **Tavily** is the enrichment source. It helps expand contact profiles without requiring the app to fetch and process everything on every request.
 - **Vercel** is the deployment target. It fits the Next.js runtime model and keeps the Slack API routes easy to ship and maintain.
 - **LLMs**: openai/gpt-4o from Github models is used with llama-3.3-70b-versatile from Groq Cloud as backup.
 
