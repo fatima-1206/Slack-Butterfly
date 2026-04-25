@@ -79,6 +79,19 @@ type LLMConfig = {
 };
 
 const LLM_REQUEST_TIMEOUT_MS = 20_000;
+const TRANSIENT_FAILURE_COOLDOWN_MS = 45_000;
+const NON_TRANSIENT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+const MAX_FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
+
+type ProviderHealth = {
+  failureStreak: number;
+  cooldownUntil: number;
+};
+
+const providerHealth: Record<LLMProvider, ProviderHealth> = {
+  github: { failureStreak: 0, cooldownUntil: 0 },
+  groq: { failureStreak: 0, cooldownUntil: 0 },
+};
 
 function normalizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
@@ -298,6 +311,25 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getCooldownRemainingMs(provider: LLMProvider): number {
+  return Math.max(0, providerHealth[provider].cooldownUntil - Date.now());
+}
+
+function markProviderSuccess(provider: LLMProvider): void {
+  providerHealth[provider].failureStreak = 0;
+  providerHealth[provider].cooldownUntil = 0;
+}
+
+function markProviderFailure(provider: LLMProvider, transient: boolean): number {
+  const health = providerHealth[provider];
+  health.failureStreak += 1;
+
+  const baseCooldown = transient ? TRANSIENT_FAILURE_COOLDOWN_MS : NON_TRANSIENT_FAILURE_COOLDOWN_MS;
+  const scaledCooldown = Math.min(baseCooldown * health.failureStreak, MAX_FAILURE_COOLDOWN_MS);
+  health.cooldownUntil = Date.now() + scaledCooldown;
+  return scaledCooldown;
+}
+
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timeoutId: NodeJS.Timeout | null = null;
 
@@ -383,11 +415,28 @@ async function callProvider(
 export async function callLLM(messages: LLMMessage[], temperature = 0.7, maxTokens = 1024): Promise<LLMResponse> {
   const primaryConfig = getLLMConfig();
   const fallbackConfig = getProviderConfig(getFallbackProvider(primaryConfig.provider));
-  const providers: LLMConfig[] = [primaryConfig, fallbackConfig];
+  const primaryCooldownMs = getCooldownRemainingMs(primaryConfig.provider);
+  const providers: LLMConfig[] = primaryCooldownMs > 0
+    ? [fallbackConfig, primaryConfig]
+    : [primaryConfig, fallbackConfig];
+
+  if (primaryCooldownMs > 0) {
+    console.warn(
+      `[LLM] Primary provider ${primaryConfig.provider} is cooling down for ${Math.ceil(primaryCooldownMs / 1000)}s; trying fallback first`
+    );
+  }
 
   let lastError: unknown;
 
   for (const providerConfig of providers) {
+    const cooldownRemainingMs = getCooldownRemainingMs(providerConfig.provider);
+    if (cooldownRemainingMs > 0) {
+      console.warn(
+        `[LLM] Skipping ${providerConfig.provider}: cooldown active for ${Math.ceil(cooldownRemainingMs / 1000)}s`
+      );
+      continue;
+    }
+
     if (!providerConfig.token) {
       console.warn(
         `[LLM] Skipping ${providerConfig.provider}: token not configured (${providerConfig.provider === "github" ? "set PRODUCTION_MODEL_TOKEN or GITHUB_TOKEN" : "set DEVELOPMENT_MODEL_TOKEN, GROQ_API_KEY, or GROQ_TOKEN"})`
@@ -401,20 +450,23 @@ export async function callLLM(messages: LLMMessage[], temperature = 0.7, maxToke
         if (providerConfig.provider !== primaryConfig.provider) {
           console.warn(`[LLM] Falling back to ${providerConfig.provider} provider`);
         }
-        return await withTimeout(
+        const response = await withTimeout(
           callProvider(providerConfig, messages, temperature, maxTokens),
           LLM_REQUEST_TIMEOUT_MS,
           `[LLM] ${providerConfig.provider}`
         );
+        markProviderSuccess(providerConfig.provider);
+        return response;
       } catch (error) {
         lastError = error;
         const transient = isTransientLLMError(error);
+        const cooldownMs = markProviderFailure(providerConfig.provider, transient);
         const status =
           error && typeof error === "object" && "status" in error
             ? (error as { status?: unknown }).status
             : "unknown";
         console.error(
-          `[LLM] ${providerConfig.provider} attempt ${attempt}/${maxAttempts} failed (status=${String(status)}, transient=${transient})`
+          `[LLM] ${providerConfig.provider} attempt ${attempt}/${maxAttempts} failed (status=${String(status)}, transient=${transient}, cooldown=${Math.ceil(cooldownMs / 1000)}s)`
         );
 
         if (!transient || attempt === maxAttempts) {
