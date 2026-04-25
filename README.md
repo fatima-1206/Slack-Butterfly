@@ -46,7 +46,7 @@ External services:
 
 - Slack API (events + user data)
 - LLM providers (Groq / OpenAI)
-- Tavily (optional enrichment)
+- Tavily (contacts enrichment)
 
 ## Conversation Flow
 
