@@ -14,9 +14,13 @@
                 "chat:write",
                 "im:history",
                 "im:read",
-                "im:write"
+                "im:write",
+                "users:read"
             ]
         },
+        "redirect_urls": [
+            "https://slack-butterfly.vercel.app/api/slack/oauth/callback"
+        ],
         "pkce_enabled": false
     },
     "settings": {

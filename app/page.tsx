@@ -23,6 +23,12 @@ export default function Home() {
         >
           API Endpoint
         </a>
+        <a
+          className="rounded-full bg-fuchsia-700 px-4 py-2 text-sm font-semibold text-white transition hover:bg-fuchsia-800"
+          href="/api/slack/oauth/start"
+        >
+          Add To Slack
+        </a>
       </header>
 
       <main className="mx-auto grid w-full max-w-6xl flex-1 gap-8 px-6 pb-12 pt-4 md:grid-cols-[1.1fr_0.9fr] md:px-10 md:pb-16">
