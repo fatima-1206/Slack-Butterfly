@@ -5,6 +5,7 @@ import {
   createConversation,
   addMessageToConversation,
   resetConversation,
+  type ProblemState,
 } from "@/lib/conversations";
 import { getAllContacts } from "@/lib/contacts";
 
@@ -34,14 +35,53 @@ type SlackMessageEvent = {
 
 type SlackEventCallbackPayload = {
   type: "event_callback";
+  team_id?: string; // Workspace ID - added for multi-workspace support
   event: SlackMessageEvent;
 };
 
-type SlackPayload = SlackUrlVerificationPayload | SlackEventCallbackPayload;
+type SlackInteractiveAction = {
+  action_id: string;
+  value?: string;
+};
+
+type SlackBlockActionsPayload = {
+  type: "block_actions";
+  team: {
+    id: string;
+  };
+  user: {
+    id: string;
+  };
+  channel?: {
+    id: string;
+  };
+  container?: {
+    channel_id?: string;
+  };
+  actions: SlackInteractiveAction[];
+};
+
+type SlackPayload = SlackUrlVerificationPayload | SlackEventCallbackPayload | SlackBlockActionsPayload;
 
 const SLACK_SIGNATURE_HEADER = "x-slack-signature";
 const SLACK_TIMESTAMP_HEADER = "x-slack-request-timestamp";
 const MAX_REQUEST_AGE_SECONDS = 60 * 5;
+
+function getBotToken(workspaceId: string): string | null {
+  const tokenMapRaw = process.env.SLACK_BOT_TOKEN_MAP;
+  if (tokenMapRaw) {
+    try {
+      const tokenMap = JSON.parse(tokenMapRaw) as Record<string, string>;
+      if (tokenMap[workspaceId]) {
+        return tokenMap[workspaceId];
+      }
+    } catch (error) {
+      console.error("[Slack] Invalid SLACK_BOT_TOKEN_MAP JSON:", error);
+    }
+  }
+
+  return process.env.SLACK_BOT_TOKEN || null;
+}
 
 function verifySlackSignature(request: Request, rawBody: string): boolean {
   const signingSecret = process.env.SLACK_SIGNING_SECRET;
@@ -64,10 +104,24 @@ function verifySlackSignature(request: Request, rawBody: string): boolean {
   return timingSafeEqual(signatureBuffer, expectedBuffer);
 }
 
-async function getUserProfile(userId: string): Promise<UserProfile | null> {
-  const botToken = process.env.SLACK_BOT_TOKEN;
+function parseSlackPayload(rawBody: string, contentType: string | null): SlackPayload | null {
+  if (contentType?.includes("application/x-www-form-urlencoded") || rawBody.startsWith("payload=")) {
+    const params = new URLSearchParams(rawBody);
+    const payloadValue = params.get("payload");
+    if (!payloadValue) {
+      return null;
+    }
+
+    return JSON.parse(payloadValue) as SlackPayload;
+  }
+
+  return JSON.parse(rawBody) as SlackPayload;
+}
+
+async function getUserProfile(workspaceId: string, userId: string): Promise<UserProfile | null> {
+  const botToken = getBotToken(workspaceId);
   if (!botToken) {
-    console.warn("SLACK_BOT_TOKEN is not set.");
+    console.warn(`[Slack] No bot token configured for workspace ${workspaceId}.`);
     return null;
   }
 
@@ -124,29 +178,171 @@ async function getUserProfile(userId: string): Promise<UserProfile | null> {
   }
 }
 
-function formatProblemSummary(problemState: any): string {
-  const lines = [
-    `*Problem Summary:*`,
-    `• Type: ${problemState.problemType || "Not specified"}`,
-    `• Summary: ${problemState.summary}`,
-    `• Key Needs: ${problemState.keyNeeds?.join(", ") || "None"}`,
-  ];
-  if (problemState.constraints?.length) {
-    lines.push(`• Constraints: ${problemState.constraints.join(", ")}`);
+function toIsoDate(value: unknown): string {
+  if (!value) {
+    return "unknown";
   }
-  if (problemState.urgency) {
-    lines.push(`• Urgency: ${problemState.urgency}`);
+
+  if (value instanceof Date) {
+    return value.toISOString();
   }
-  if (problemState.domain) {
-    lines.push(`• Domain: ${problemState.domain}`);
+
+  if (typeof value === "object" && value !== null && "toDate" in value) {
+    try {
+      // Call as a method on the original object so Firestore Timestamp keeps its `this` binding.
+      const converted = (value as { toDate: () => Date }).toDate();
+      if (converted instanceof Date && !Number.isNaN(converted.getTime())) {
+        return converted.toISOString();
+      }
+    } catch {
+      // Fall through to other parsing strategies below.
+    }
   }
-  return lines.join("\n");
+
+  if (typeof value === "string" || typeof value === "number") {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+
+  return "unknown";
 }
 
-async function postDmReply(channel: string, text: string): Promise<void> {
-  const botToken = process.env.SLACK_BOT_TOKEN;
+function summarizeConfidence(confidence: number): "unclear" | "clarifying" | "executing" {
+  if (confidence < 0.3) {
+    return "unclear";
+  }
+  if (confidence < 0.7) {
+    return "clarifying";
+  }
+  return "executing";
+}
+
+function formatDetailedStatus(conversation: {
+  problemState: ProblemState;
+  confidence: number;
+  state: string;
+  version: number;
+  lastUpdated: unknown;
+  messages: Array<{ role: "user" | "assistant"; content: string; timestamp?: number }>;
+}): string {
+  const problemState = conversation.problemState;
+  const requiredFields = {
+    problemType: !!problemState.problemType?.trim(),
+    summary: !!problemState.summary?.trim(),
+    keyNeeds: (problemState.keyNeeds?.length || 0) > 0,
+  };
+  const requiredComplete = Object.values(requiredFields).every(Boolean);
+  const missingRequired = Object.entries(requiredFields)
+    .filter(([, complete]) => !complete)
+    .map(([field]) => field);
+
+  const confidencePercent = (conversation.confidence * 100).toFixed(0);
+  const confidenceBand = summarizeConfidence(conversation.confidence);
+  const recentMessages = conversation.messages.slice(-4);
+
+  const contextPreview =
+    recentMessages.length === 0
+      ? "• No messages yet"
+      : recentMessages
+          .map((message) => {
+            const label = message.role === "user" ? "User" : "Bot";
+            const clipped = message.content.length > 140
+              ? `${message.content.slice(0, 137)}...`
+              : message.content;
+            return `• ${label}: ${clipped}`;
+          })
+          .join("\n");
+
+  const optionalFields = [
+    `• Constraints: ${problemState.constraints?.length ? problemState.constraints.join(", ") : "none"}`,
+    `• Urgency: ${problemState.urgency || "unspecified"}`,
+    `• Domain: ${problemState.domain || "unspecified"}`,
+  ].join("\n");
+
+  return [
+    "*Detailed Problem State*",
+    "",
+    "*Structured Problem*",
+    `• Type: ${problemState.problemType || "unspecified"}`,
+    `• Summary: ${problemState.summary || "unspecified"}`,
+    `• Key Needs: ${problemState.keyNeeds?.length ? problemState.keyNeeds.join(", ") : "none"}`,
+    optionalFields,
+    "",
+    "*Completeness Check (required fields)*",
+    `• problemType: ${requiredFields.problemType ? "complete" : "missing"}`,
+    `• summary: ${requiredFields.summary ? "complete" : "missing"}`,
+    `• keyNeeds: ${requiredFields.keyNeeds ? "complete" : "missing"}`,
+    `• Required complete: ${requiredComplete ? "yes" : `no (${missingRequired.join(", ")})`}`,
+    "",
+    "*Reasoning Confidence*",
+    `• Confidence: ${confidencePercent}% (${confidenceBand})`,
+    `• Conversation state: ${conversation.state}`,
+    "",
+    "*Conversation Telemetry*",
+    `• Messages: ${conversation.messages.length}`,
+    `• Version: ${conversation.version}`,
+    `• Last updated: ${toIsoDate(conversation.lastUpdated)}`,
+    "",
+    "*Recent Context Snapshot*",
+    contextPreview,
+  ].join("\n");
+}
+
+function buildCommandButtons() {
+  return [
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Status" },
+          action_id: "command_status",
+          value: "status",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Help" },
+          action_id: "command_help",
+          value: "help",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Reset" },
+          action_id: "command_reset",
+          value: "reset",
+        },
+      ],
+    },
+  ];
+}
+
+function buildReplyBlocks(text: string) {
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text,
+      },
+    },
+    {
+      type: "divider",
+    },
+    ...buildCommandButtons(),
+  ];
+}
+
+async function postDmReply(
+  workspaceId: string,
+  channel: string,
+  text: string,
+  includeButtons = false
+): Promise<void> {
+  const botToken = getBotToken(workspaceId);
   if (!botToken) {
-    console.warn("SLACK_BOT_TOKEN is not set.");
+    console.warn(`[Slack] No bot token configured for workspace ${workspaceId}.`);
     return;
   }
 
@@ -161,6 +357,7 @@ async function postDmReply(channel: string, text: string): Promise<void> {
     body: JSON.stringify({
       channel,
       text,
+      ...(includeButtons ? { blocks: buildReplyBlocks(text) } : {}),
     }),
   });
 
@@ -186,6 +383,7 @@ export async function POST(request: Request) {
   console.log("[Route] Incoming Slack event");
 
   const rawBody = await request.text();
+  const contentType = request.headers.get("content-type");
 
   if (!verifySlackSignature(request, rawBody)) {
     console.warn("[Route] Invalid signature");
@@ -194,7 +392,11 @@ export async function POST(request: Request) {
 
   let payload: SlackPayload;
   try {
-    payload = JSON.parse(rawBody) as SlackPayload;
+    const parsedPayload = parseSlackPayload(rawBody, contentType);
+    if (!parsedPayload) {
+      throw new Error("Unable to parse Slack payload");
+    }
+    payload = parsedPayload;
   } catch (error) {
     console.error("[Route] Invalid JSON payload:", error);
     return Response.json({ ok: false, error: "invalid_json" }, { status: 400 });
@@ -205,11 +407,36 @@ export async function POST(request: Request) {
     return Response.json({ challenge: payload.challenge });
   }
 
+  if (payload.type === "block_actions") {
+    const workspaceId = payload.team.id;
+    const userId = payload.user.id;
+    const channelId = payload.channel?.id || payload.container?.channel_id;
+    const action = payload.actions[0];
+
+    if (!channelId || !action) {
+      console.error("[Route] Missing channel or action in block_actions payload");
+      return Response.json({ ok: false, error: "invalid_interactive_payload" }, { status: 400 });
+    }
+
+    const command = action.value || action.action_id.replace("command_", "");
+    console.log(`[Route] Button click from ${userId}: ${command}`);
+
+    processUserMessage(workspaceId, userId, command, channelId).catch((error) => {
+      console.error("[Route] Background processing error for interactive action:", error);
+    });
+
+    return Response.json({ ok: true });
+  }
+
   if (payload.type === "event_callback") {
-    const { event } = payload;
+    const { event, team_id: workspaceId } = payload;
+    if (!workspaceId) {
+      console.error("[Route] Missing team_id in event_callback payload");
+      return Response.json({ ok: false, error: "missing_workspace_id" }, { status: 400 });
+    }
 
     // Dedup check using event ts (timestamp) + user
-    const eventKey = `${event.user || "unknown"}-${event.ts || Date.now()}`;
+    const eventKey = `${workspaceId}-${event.user || "unknown"}-${event.ts || Date.now()}`;
     const lastSeen = recentEvents.get(eventKey);
     if (lastSeen && Date.now() - lastSeen < EVENT_DEDUP_WINDOW) {
       console.log(`[Route] Duplicate event detected (${eventKey}), ignoring`);
@@ -244,7 +471,7 @@ export async function POST(request: Request) {
       console.log(`[Route] Processing DM from ${userId}: "${userMessage.substring(0, 50)}..."`);
 
       // Process async, but respond to Slack immediately
-      processUserMessage(userId, userMessage, channelId).catch((error) => {
+      processUserMessage(workspaceId, userId, userMessage, channelId).catch((error) => {
         console.error("[Route] Background processing error:", error);
       });
 
@@ -258,12 +485,17 @@ export async function POST(request: Request) {
   return Response.json({ ok: true });
 }
 
-async function processUserMessage(userId: string, userMessage: string, channelId: string) {
+async function processUserMessage(
+  workspaceId: string,
+  userId: string,
+  userMessage: string,
+  channelId: string
+) {
   try {
-    console.log(`[Process] Starting for user ${userId}`);
+    console.log(`[Process] Starting for workspace ${workspaceId} user ${userId}`);
 
     // Fetch user profile for context awareness
-    const userProfile = await getUserProfile(userId);
+    const userProfile = await getUserProfile(workspaceId, userId);
     console.log(`[Process] User profile: role=${userProfile?.role}, title=${userProfile?.title}`);
 
     // Handle special commands
@@ -271,8 +503,9 @@ async function processUserMessage(userId: string, userMessage: string, channelId
 
     if (commandMatch === "reset") {
       console.log(`[Process] Handling 'reset' command for user ${userId}`);
-      await resetConversation(userId);
+      await resetConversation(workspaceId, userId);
       await postDmReply(
+        workspaceId,
         channelId,
         "Conversation reset. Tell me about a problem you need help solving."
       );
@@ -281,14 +514,14 @@ async function processUserMessage(userId: string, userMessage: string, channelId
 
     if (commandMatch === "status" || commandMatch === "show problem") {
       console.log(`[Process] Handling 'status' command for user ${userId}`);
-      const conversation = await getConversation(userId);
+      const conversation = await getConversation(workspaceId, userId);
       if (!conversation) {
-        await postDmReply(channelId, "No active conversation. Tell me about a problem you need help solving.");
+        await postDmReply(workspaceId, channelId, "No active conversation. Tell me about a problem you need help solving.");
       } else if (!conversation.problemState || !conversation.problemState.summary) {
-        await postDmReply(channelId, "I haven't captured a problem statement yet. Share more about what you need help with.");
+        await postDmReply(workspaceId, channelId, "I haven't captured a problem statement yet. Share more about what you need help with.");
       } else {
-        const statusMsg = `${formatProblemSummary(conversation.problemState)}\n\nConfidence: ${(conversation.confidence * 100).toFixed(0)}% | Messages: ${conversation.messages.length} | State: ${conversation.state}`;
-        await postDmReply(channelId, statusMsg);
+        const statusMsg = formatDetailedStatus(conversation);
+        await postDmReply(workspaceId, channelId, statusMsg);
       }
       return;
     }
@@ -296,16 +529,16 @@ async function processUserMessage(userId: string, userMessage: string, channelId
     if (commandMatch === "help") {
       console.log(`[Process] Handling 'help' command for user ${userId}`);
       const helpText = `*Available commands:*\n• *status* or *show problem* - See my understanding of your problem\n• *reset* - Start over with a new problem\n• *help* - Show this message\n\n*How to use me:*\n1. Describe a problem you need help solving\n2. I'll ask clarifying questions to understand better\n3. Once I have enough context, I'll recommend people who can help\n4. Feedback helps me refine: "more backend people" or "that person isn't relevant"`;
-      await postDmReply(channelId, helpText);
+      await postDmReply(workspaceId, channelId, helpText, true);
       return;
     }
 
     // Get or create conversation
     console.log(`[Process] Fetching conversation for user ${userId}`);
-    let conversation = await getConversation(userId);
+    let conversation = await getConversation(workspaceId, userId);
     if (!conversation) {
       console.log(`[Process] Conversation not found, creating new one for user ${userId}`);
-      conversation = await createConversation(userId);
+      conversation = await createConversation(workspaceId, userId);
     }
     console.log(
       `[Process] Conversation state: ${conversation.state}, confidence: ${conversation.confidence}, messages: ${conversation.messages.length}`
@@ -330,12 +563,14 @@ async function processUserMessage(userId: string, userMessage: string, channelId
 
     // Determine the response
     let botResponse: string;
+    let showCommandButtons = false;
 
     if (analysis.nextAction === "ready_to_recommend" || analysis.nextAction === "refine") {
+      showCommandButtons = true;
       console.log(`[Process] Entering recommendation mode${analysis.nextAction === "refine" ? " (refinement)" : ""}`);
       // We have enough info to recommend contacts
       console.log(`[Process] Fetching contacts from Slack`);
-      const allContacts = await getAllContacts();
+      const allContacts = await getAllContacts(workspaceId);
       console.log(`[Process] Fetched ${allContacts.length} contacts`);
       const contactsById = new Map(allContacts.map((c) => [c.id, c]));
 
@@ -363,8 +598,8 @@ async function processUserMessage(userId: string, userMessage: string, channelId
             const contact = contactsById.get(rec.contactId);
             const displayName = contact?.name || rec.contactId;
             const displayTitle = contact?.title ? ` (${contact.title})` : "";
-            const askLine = rec.suggestedAsk ? `\n   Ask them: "${rec.suggestedAsk}"` : "";
-            return `${idx + 1}. *${displayName}*${displayTitle} - ${rec.why}\n   Score: ${(rec.score * 100).toFixed(0)}%${askLine}`;
+            const askLine = rec.suggestedAsk ? `\n   *Ask them:* "${rec.suggestedAsk}"` : "";
+            return `${idx + 1}. *${displayName}*${displayTitle} - ${rec.why}\n   *Score:* ${(rec.score * 100).toFixed(0)}%${askLine}`;
           })
           .join("\n\n");
 
@@ -379,6 +614,7 @@ async function processUserMessage(userId: string, userMessage: string, channelId
       console.log(`[Process] Updating conversation to recommending state`);
       // Update conversation to recommending state
       await addMessageToConversation(
+        workspaceId,
         userId,
         { role: "user", content: userMessage },
         analysis.updatedState,
@@ -399,6 +635,7 @@ async function processUserMessage(userId: string, userMessage: string, channelId
       console.log(`[Process] Clarification questions: ${analysis.clarificationQuestions.length}`);
       // Update conversation with clarification state
       await addMessageToConversation(
+        workspaceId,
         userId,
         { role: "user", content: userMessage },
         analysis.updatedState,
@@ -410,6 +647,7 @@ async function processUserMessage(userId: string, userMessage: string, channelId
     console.log(`[Process] Saving bot response to conversation`);
     // Add bot response to conversation
     await addMessageToConversation(
+      workspaceId,
       userId,
       { role: "assistant", content: botResponse },
       analysis.updatedState,
@@ -421,13 +659,14 @@ async function processUserMessage(userId: string, userMessage: string, channelId
 
     console.log(`[Process] Sending response to Slack (length: ${botResponse.length})`);
     // Send response to user
-    await postDmReply(channelId, botResponse);
+    await postDmReply(workspaceId, channelId, botResponse, showCommandButtons);
     console.log(`[Process] Completed successfully for user ${userId}`);
   } catch (error) {
     console.error("[Process] Error processing message:", error);
     try {
       console.log(`[Process] Sending error message to user`);
       await postDmReply(
+        workspaceId,
         channelId,
         "Sorry, something went wrong. Please try again or type 'reset' to start over."
       );

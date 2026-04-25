@@ -20,6 +20,10 @@
         "pkce_enabled": false
     },
     "settings": {
+        "interactivity": {
+            "is_enabled": true,
+            "request_url": "https://slack-butterfly.vercel.app/api/slack/events"
+        },
         "event_subscriptions": {
             "request_url": "https://slack-butterfly.vercel.app/api/slack/events",
             "bot_events": [
