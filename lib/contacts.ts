@@ -25,6 +25,18 @@ interface TavilyEnrichmentResult {
   experience: string;
 }
 
+interface TavilySearchResult {
+  title?: string;
+  content?: string;
+  source?: string;
+}
+
+interface TavilyScoredResult {
+  result: TavilySearchResult;
+  confidence: number;
+  signals: string[];
+}
+
 interface SlackUser {
   id: string;
   real_name: string;
@@ -94,6 +106,142 @@ function isSystemContact(contact: Pick<Contact, "id" | "name">): boolean {
   return id === "USLACKBOT" || name.includes("slackbot");
 }
 
+function normalizeForMatch(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function extractMeaningfulTokens(value: string): string[] {
+  const stopWords = new Set([
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "inc",
+    "llc",
+    "ltd",
+    "co",
+    "company",
+    "profile",
+    "professional",
+    "slack",
+    "user",
+    "member",
+  ]);
+
+  return normalizeForMatch(value)
+    .split(/\s+/)
+    .filter((token) => token.length >= 3 && !stopWords.has(token));
+}
+
+function extractEmailTokens(email: string): string[] {
+  const [localPart = "", domainPart = ""] = email.toLowerCase().split("@");
+  const domainTokens = domainPart
+    .split(".")
+    .filter((token) => token.length >= 3 && !["com", "net", "org", "io", "co"].includes(token));
+
+  return [...new Set([...localPart.split(/[._+-]+/).filter((token) => token.length >= 3), ...domainTokens])];
+}
+
+function buildTavilyQuery(contact: Contact): string {
+  const queryParts = [`"${contact.name}"`];
+
+  const title = normalizeForMatch(contact.title);
+  if (title && title !== "slack user") {
+    queryParts.push(contact.title);
+  }
+
+  if (contact.email) {
+    const [localPart] = contact.email.split("@");
+    if (localPart) {
+      queryParts.push(localPart);
+    }
+  }
+
+  queryParts.push("professional profile");
+  return queryParts.join(" ");
+}
+
+function scoreTavilyResult(contact: Contact, result: TavilySearchResult): TavilyScoredResult {
+  const text = normalizeForMatch(`${result.title || ""} ${result.content || ""} ${result.source || ""}`);
+  const signals: string[] = [];
+  let confidence = 0;
+
+  const nameTokens = extractMeaningfulTokens(contact.name);
+  const fullName = normalizeForMatch(contact.name);
+  const titleTokens = normalizeForMatch(contact.title) === "slack user" ? [] : extractMeaningfulTokens(contact.title);
+  const skillTokens = (contact.skills || []).flatMap((skill) => extractMeaningfulTokens(skill));
+  const identityTokens = [...new Set([...titleTokens, ...skillTokens])];
+  const emailTokens = contact.email ? extractEmailTokens(contact.email) : [];
+
+  if (fullName && text.includes(fullName)) {
+    confidence += 0.5;
+    signals.push("full-name");
+  } else {
+    const matchedNameTokens = nameTokens.filter((token) => text.includes(token));
+    if (matchedNameTokens.length >= 2) {
+      confidence += 0.35;
+      signals.push("name-tokens");
+    } else if (matchedNameTokens.length === 1) {
+      confidence += 0.1;
+      signals.push("partial-name");
+    }
+  }
+
+  if (identityTokens.length > 0) {
+    const matchedIdentityTokens = identityTokens.filter((token) => text.includes(token));
+    if (matchedIdentityTokens.length >= 2) {
+      confidence += 0.3;
+      signals.push("identity-match");
+    } else if (matchedIdentityTokens.length === 1) {
+      confidence += 0.2;
+      signals.push("identity-partial");
+    }
+  }
+
+  if (emailTokens.length > 0) {
+    const matchedEmailTokens = emailTokens.filter((token) => text.includes(token));
+    if (matchedEmailTokens.length > 0) {
+      confidence += 0.25;
+      signals.push("email-match");
+    }
+  }
+
+  if (result.source) {
+    try {
+      const hostname = new URL(result.source).hostname;
+      if (["linkedin.com", "github.com", "twitter.com", "x.com"].some((domain) => hostname.includes(domain))) {
+        confidence += 0.05;
+        signals.push("profile-domain");
+      }
+    } catch {
+      // Ignore malformed result sources.
+    }
+  }
+
+  return {
+    result,
+    confidence: Math.min(1, confidence),
+    signals,
+  };
+}
+
+function isTrustedTavilyMatch(candidate: TavilyScoredResult): boolean {
+  const hasNameSignal = candidate.signals.some((signal) => signal === "full-name" || signal === "name-tokens");
+  const hasIdentitySignal = candidate.signals.some((signal) =>
+    signal === "identity-match" || signal === "identity-partial" || signal === "email-match"
+  );
+
+  return hasNameSignal && hasIdentitySignal && candidate.confidence >= 0.7;
+}
+
+function combineMatchedResults(matches: TavilyScoredResult[]): string {
+  return matches
+    .slice(0, 3)
+    .map((match) => `${match.result.title || ""} ${match.result.content || ""}`.trim())
+    .join(" ");
+}
+
 /**
  * Enrich a single contact using Tavily API
  * Returns enriched data or null if enrichment fails
@@ -105,10 +253,19 @@ async function enrichContactWithTavily(contact: Contact): Promise<TavilyEnrichme
     return null;
   }
 
+  const hasCrossCheckSignals =
+    extractMeaningfulTokens(contact.title).length > 0 || (contact.skills || []).length > 0 || contact.email.length > 0;
+  if (!hasCrossCheckSignals) {
+    console.log(
+      `[Tavily] Skipping enrichment for ${contact.name} because there is no secondary identity signal to verify against`
+    );
+    return null;
+  }
+
   try {
     const payload = {
       api_key: tavilyKey,
-      query: `${contact.name} ${contact.title} professional profile`,
+      query: buildTavilyQuery(contact),
       include_domains: ["linkedin.com", "github.com", "twitter.com"],
       max_results: 5,
     };
@@ -127,11 +284,7 @@ async function enrichContactWithTavily(contact: Contact): Promise<TavilyEnrichme
     }
 
     const data = (await response.json()) as {
-      results?: Array<{
-        title?: string;
-        content?: string;
-        source?: string;
-      }>;
+      results?: TavilySearchResult[];
     };
 
     if (!data.results || data.results.length === 0) {
@@ -139,10 +292,20 @@ async function enrichContactWithTavily(contact: Contact): Promise<TavilyEnrichme
       return null;
     }
 
-    // Extract skills and experience from search results
-    const combinedText = data.results
-      .map((r) => `${r.title || ""} ${r.content || ""}`)
-      .join(" ");
+    const scoredResults = data.results
+      .map((result) => scoreTavilyResult(contact, result))
+      .filter(isTrustedTavilyMatch)
+      .sort((a, b) => b.confidence - a.confidence);
+
+    if (scoredResults.length === 0) {
+      console.log(
+        `[Tavily] Rejected results for ${contact.name} because they did not cross-check against title, skills, or email`
+      );
+      return null;
+    }
+
+    // Extract skills and experience from only the results that matched the same person.
+    const combinedText = combineMatchedResults(scoredResults);
 
     // Parse skills (look for common tech keywords and job titles context)
     const skillKeywords = [
@@ -177,19 +340,19 @@ async function enrichContactWithTavily(contact: Contact): Promise<TavilyEnrichme
     const textLower = combinedText.toLowerCase();
     const skills = skillKeywords.filter((skill) => textLower.includes(skill));
 
-    // Extract summary (use first 300 chars from first result that looks like a profile)
-    const summary = data.results
-      .filter((r) => r.content && r.content.length > 50)
-      .map((r) => r.content || "")
+    // Extract summary from the best-matching profile results.
+    const summary = scoredResults
+      .map((match) => match.result.content || "")
+      .filter((content) => content.length > 50)
       .join(" ")
       .substring(0, 300)
       .trim();
 
     // Extract experience info (mentions of companies, roles)
-    const experience = data.results
-      .filter((r) => r.title)
+    const experience = scoredResults
+      .map((match) => match.result.title || "")
+      .filter((title) => title.length > 0)
       .slice(0, 3)
-      .map((r) => r.title || "")
       .join("; ");
 
     return {
