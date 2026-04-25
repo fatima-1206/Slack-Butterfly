@@ -240,6 +240,7 @@ function getLLMProvider(): LLMProvider {
 
 function getProviderConfig(provider: LLMProvider): LLMConfig {
   if (provider === "github") {
+    console.log("Using GitHub GPT-4 model for LLM interactions");
     return {
       provider: "github" as const,
       model: process.env.PRODUCTION_MODEL || "openai/gpt-4o",
