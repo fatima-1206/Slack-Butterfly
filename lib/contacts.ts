@@ -1,5 +1,4 @@
 import { getFirestore } from "@/lib/firebase";
-import { getStoredBotToken } from "@/lib/slack-installations";
 
 /**
  * Fetch contacts from Slack workspace members
@@ -73,7 +72,7 @@ const TAVILY_BATCH_DELAY = 500; // 500ms between requests to avoid rate limits
 const contactsCacheByWorkspace: Map<string, Contact[]> = new Map();
 const cacheTimestampByWorkspace: Map<string, number> = new Map();
 
-function getBotTokenFromEnv(workspaceId: string): string | null {
+function getBotToken(workspaceId: string): string | null {
   const tokenMapRaw = process.env.SLACK_BOT_TOKEN_MAP;
   if (tokenMapRaw) {
     try {
@@ -87,15 +86,6 @@ function getBotTokenFromEnv(workspaceId: string): string | null {
   }
 
   return process.env.SLACK_BOT_TOKEN || null;
-}
-
-async function getBotToken(workspaceId: string): Promise<string | null> {
-  const storedToken = await getStoredBotToken(workspaceId);
-  if (storedToken) {
-    return storedToken;
-  }
-
-  return getBotTokenFromEnv(workspaceId);
 }
 
 function isSystemContact(contact: Pick<Contact, "id" | "name">): boolean {
@@ -530,7 +520,7 @@ export function filterContactsByDomain(domain: string, contacts: Contact[]): Con
 
 async function fetchSlackUsers(workspaceId: string): Promise<SlackUser[]> {
   console.log("Fetching Slack users...👥");
-  const botToken = await getBotToken(workspaceId);
+  const botToken = getBotToken(workspaceId);
   if (!botToken) {
     throw new Error(`Slack bot token is not configured for workspace ${workspaceId}`);
   }

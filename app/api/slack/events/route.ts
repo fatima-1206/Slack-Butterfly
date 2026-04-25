@@ -1,7 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { after } from "next/server";
 import { analyzeConversation, analyzeRecommendationFeedback, rankContacts } from "@/lib/llm";
-import { getStoredBotToken } from "@/lib/slack-installations";
 import {
   getConversation,
   createConversation,
@@ -69,33 +68,7 @@ const SLACK_SIGNATURE_HEADER = "x-slack-signature";
 const SLACK_TIMESTAMP_HEADER = "x-slack-request-timestamp";
 const MAX_REQUEST_AGE_SECONDS = 60 * 5;
 
-function getSigningSecrets(): string[] {
-  const secrets = new Set<string>();
-
-  const primarySecret = process.env.SLACK_SIGNING_SECRET?.trim();
-  if (primarySecret) {
-    secrets.add(primarySecret);
-  }
-
-  const secretMapRaw = process.env.SLACK_SIGNING_SECRET_MAP;
-  if (secretMapRaw) {
-    try {
-      const secretMap = JSON.parse(secretMapRaw) as Record<string, string>;
-      for (const value of Object.values(secretMap)) {
-        const secret = value?.trim();
-        if (secret) {
-          secrets.add(secret);
-        }
-      }
-    } catch (error) {
-      console.error("[Slack] Invalid SLACK_SIGNING_SECRET_MAP JSON:", error);
-    }
-  }
-
-  return [...secrets];
-}
-
-function getBotTokenFromEnv(workspaceId: string): string | null {
+function getBotToken(workspaceId: string): string | null {
   const tokenMapRaw = process.env.SLACK_BOT_TOKEN_MAP;
   if (tokenMapRaw) {
     try {
@@ -111,19 +84,10 @@ function getBotTokenFromEnv(workspaceId: string): string | null {
   return process.env.SLACK_BOT_TOKEN || null;
 }
 
-async function getBotToken(workspaceId: string): Promise<string | null> {
-  const storedToken = await getStoredBotToken(workspaceId);
-  if (storedToken) {
-    return storedToken;
-  }
-
-  return getBotTokenFromEnv(workspaceId);
-}
-
 function verifySlackSignature(request: Request, rawBody: string): boolean {
-  const signingSecrets = getSigningSecrets();
-  if (signingSecrets.length === 0) {
-    console.warn("SLACK_SIGNING_SECRET or SLACK_SIGNING_SECRET_MAP is not set, skipping verification.");
+  const signingSecret = process.env.SLACK_SIGNING_SECRET;
+  if (!signingSecret) {
+    console.warn("SLACK_SIGNING_SECRET is not set, skipping verification.");
     return true;
   }
   const signature = request.headers.get(SLACK_SIGNATURE_HEADER);
@@ -154,40 +118,28 @@ function verifySlackSignature(request: Request, rawBody: string): boolean {
     return false;
   }
   const basestring = `v0:${timestamp}:${rawBody}`;
+  const expectedSignature = `v0=${createHmac("sha256", signingSecret).update(basestring).digest("hex")}`;
   const signatureBuffer = Buffer.from(signature);
-  if (signatureBuffer.length === 0) {
+  const expectedBuffer = Buffer.from(expectedSignature);
+  if (signatureBuffer.length !== expectedBuffer.length) {
     console.warn("[Route] Signature verification failed: signature length mismatch", {
       receivedLength: signatureBuffer.length,
-      expectedLength: "non-zero",
+      expectedLength: expectedBuffer.length,
       receivedPrefix: signature.slice(0, 6),
     });
     return false;
   }
 
-  let matchedSecret = false;
-  for (const signingSecret of signingSecrets) {
-    const expectedSignature = `v0=${createHmac("sha256", signingSecret).update(basestring).digest("hex")}`;
-    const expectedBuffer = Buffer.from(expectedSignature);
-
-    if (signatureBuffer.length !== expectedBuffer.length) {
-      continue;
-    }
-
-    if (timingSafeEqual(signatureBuffer, expectedBuffer)) {
-      matchedSecret = true;
-      break;
-    }
-  }
-
-  if (!matchedSecret) {
+  const isValid = timingSafeEqual(signatureBuffer, expectedBuffer);
+  if (!isValid) {
     console.warn("[Route] Signature verification failed: digest mismatch", {
       receivedPrefix: signature.slice(0, 10),
-      availableSecrets: signingSecrets.length,
+      expectedPrefix: expectedSignature.slice(0, 10),
       timestamp,
     });
   }
 
-  return matchedSecret;
+  return isValid;
 }
 
 function parseSlackPayload(rawBody: string, contentType: string | null): SlackPayload | null {
@@ -205,7 +157,7 @@ function parseSlackPayload(rawBody: string, contentType: string | null): SlackPa
 }
 
 async function getUserProfile(workspaceId: string, userId: string): Promise<UserProfile | null> {
-  const botToken = await getBotToken(workspaceId);
+  const botToken = getBotToken(workspaceId);
   if (!botToken) {
     console.warn(`[Slack] No bot token configured for workspace ${workspaceId}.`);
     return null;
@@ -426,7 +378,7 @@ async function postDmReply(
   text: string,
   includeButtons = false
 ): Promise<void> {
-  const botToken = await getBotToken(workspaceId);
+  const botToken = getBotToken(workspaceId);
   if (!botToken) {
     console.warn(`[Slack] No bot token configured for workspace ${workspaceId}.`);
     return;
