@@ -25,6 +25,28 @@ It does this by:
 
 The system is stateful — each message updates its understanding instead of starting from scratch.
 
+## Table of Contents
+
+  - [Tech Stack](#tech-stack)
+  - [Architecture](#architecture)
+  - [Conversation Flow](#conversation-flow)
+  - [Agent Design](#agent-design)
+  - [Data Model](#data-model)
+  - [Setup](#setup)
+  - [Future Improvements](#future-improvements)
+
+## Tech Stack
+
+This project uses a small set of tools that each have a specific role in the system.
+
+- **Next.js** is the application framework and API layer. It keeps the Slack event handlers, OAuth callbacks, and admin routes in one codebase, which simplifies deployment and server-side integration.
+- **TypeScript** is used for type safety across the app, especially where Slack payloads, conversation state, and model outputs need to stay consistent.
+- **Slack** is the user-facing interface. The bot lives in DMs, which matches the problem-solving workflow and keeps the experience low-friction.
+- **Firestore / Firebase** stores conversation state and cached contact data. It was chosen because the app needs persistent, per-user state across messages and fast reads for repeated recommendations.
+- **Groq and OpenAI** provide the LLM layer. They are used for structured extraction and reasoning over the conversation, with the app able to switch providers depending on availability, latency, or quality tradeoffs.
+- **Tavily** is the optional enrichment source. It helps expand contact profiles without requiring the app to fetch and process everything on every request.
+- **Vercel** is the deployment target. It fits the Next.js runtime model and keeps the Slack API routes easy to ship and maintain.
+- **LLMs**: openai/gpt-4o from Github models is used with llama-3.3-70b-versatile from Groq Cloud as backup.
 
 ## Architecture
 
@@ -80,6 +102,9 @@ The system operates in two modes:
 
 ## Data Model
 
+- Firebase had to be used for state management due to the need for persistence across messages and users, as well as real-time updates. The structured problem state allows the agent to maintain context and make informed decisions based on the evolving conversation.
+
+- Additionally, this allows us to enrich contact profiles once and cache them in firebase allowing us optimized Tavily API usage and faster response times.
 
 - Every user message refines the problem statement and updates the conversation state until it's ready for recommendations.
 
@@ -200,3 +225,7 @@ ngrok http 3000
 
 - Organizations may be able to provide access to data such as the resumes of their employees, which would allow for much richer profiles and more accurate recommendations. If such data were available, the agent could be designed to leverage it effectively while ensuring privacy and security considerations are met.
 
+
+- Improve response latency by optimizing LLM prompts, caching results, and parallelizing data retrieval.
+
+---
