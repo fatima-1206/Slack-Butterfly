@@ -328,35 +328,47 @@ function formatDetailedStatus(conversation: {
   ].join("\n");
 }
 
-function buildCommandButtons() {
+function buildCommandButtons(includeRecommend = false) {
+  const elements: any[] = [
+    {
+      type: "button",
+      text: { type: "plain_text", text: "Status" },
+      action_id: "command_status",
+      value: "status",
+    },
+    {
+      type: "button",
+      text: { type: "plain_text", text: "Help" },
+      action_id: "command_help",
+      value: "help",
+    },
+    {
+      type: "button",
+      text: { type: "plain_text", text: "Reset" },
+      action_id: "command_reset",
+      value: "reset",
+    },
+  ];
+
+  if (includeRecommend) {
+    elements.push({
+      type: "button",
+      text: { type: "plain_text", text: "Recommend anyway" },
+      action_id: "command_recommend_anyway",
+      value: "recommend_anyway",
+      style: "primary",
+    });
+  }
+
   return [
     {
       type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "Status" },
-          action_id: "command_status",
-          value: "status",
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "Help" },
-          action_id: "command_help",
-          value: "help",
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "Reset" },
-          action_id: "command_reset",
-          value: "reset",
-        },
-      ],
+      elements,
     },
   ];
 }
 
-function buildReplyBlocks(text: string) {
+function buildReplyBlocks(text: string, includeRecommend = false) {
   return [
     {
       type: "section",
@@ -368,7 +380,7 @@ function buildReplyBlocks(text: string) {
     {
       type: "divider",
     },
-    ...buildCommandButtons(),
+    ...buildCommandButtons(includeRecommend),
   ];
 }
 
@@ -376,7 +388,8 @@ async function postDmReply(
   workspaceId: string,
   channel: string,
   text: string,
-  includeButtons = false
+  includeButtons = false,
+  includeRecommend = false
 ): Promise<void> {
   const botToken = getBotToken(workspaceId);
   if (!botToken) {
@@ -395,7 +408,7 @@ async function postDmReply(
     body: JSON.stringify({
       channel,
       text,
-      ...(includeButtons ? { blocks: buildReplyBlocks(text) } : {}),
+      ...(includeButtons ? { blocks: buildReplyBlocks(text, includeRecommend) } : {}),
     }),
   });
 
@@ -559,6 +572,63 @@ async function processUserMessage(
       return;
     }
 
+    if (commandMatch === "recommend_anyway" || commandMatch === "recommend") {
+      console.log(`[Process] Handling 'recommend_anyway' action for user ${userId}`);
+      // Fetch conversation and run recommendation using current problem state
+      const conversation = await getConversation(workspaceId, userId);
+      if (!conversation || !conversation.problemState || !conversation.problemState.summary) {
+        await postDmReply(workspaceId, channelId, "No problem captured yet. Tell me about the issue you need help with.");
+        return;
+      }
+
+      // Fetch contacts and rank regardless of confidence
+      const allContacts = await getAllContacts(workspaceId);
+      const recommendations = await rankContacts(
+        conversation.problemState,
+        allContacts,
+        undefined,
+        undefined
+      );
+
+      if (recommendations.length === 0) {
+        await postDmReply(workspaceId, channelId, "I couldn't find strong matches in the contact list.", true);
+        return;
+      }
+
+      const contactsById = new Map(allContacts.map((c) => [c.id, c]));
+      const recommendationText = recommendations
+        .map((rec, idx) => {
+          const contact = contactsById.get(rec.contactId);
+          const displayName = contact?.name || rec.contactId;
+          const displayTitle = contact?.title ? ` (${contact.title})` : "";
+          const askLine = rec.suggestedAsk ? `\n   *Ask them:* "${rec.suggestedAsk}"` : "";
+          return `${idx + 1}. *${displayName}*${displayTitle} - ${rec.why}\n   *Score:* ${(rec.score * 100).toFixed(0)}%${askLine}`;
+        })
+        .join("\n\n");
+
+      const botResponse = `Here are some people who might help (per your request to recommend anyway):\n\n${recommendationText}`;
+      await addMessageToConversation(
+        workspaceId,
+        userId,
+        { role: "user", content: userMessage },
+        conversation.problemState,
+        conversation.confidence,
+        "recommending"
+      );
+
+      await addMessageToConversation(
+        workspaceId,
+        userId,
+        { role: "assistant", content: botResponse },
+        conversation.problemState,
+        conversation.confidence,
+        "recommending"
+      );
+
+      await postDmReply(workspaceId, channelId, botResponse, true);
+      return;
+    }
+
     if (commandMatch === "status" || commandMatch === "show problem") {
       console.log(`[Process] Handling 'status' command for user ${userId}`);
       const conversation = await getConversation(workspaceId, userId);
@@ -611,9 +681,11 @@ async function processUserMessage(
     // Determine the response
     let botResponse: string;
     let showCommandButtons = false;
+    let includeRecommendButton = false;
 
     if (analysis.nextAction === "ready_to_recommend" || analysis.nextAction === "refine") {
       showCommandButtons = true;
+      includeRecommendButton = false;
       console.log(`[Process] Entering recommendation mode${analysis.nextAction === "refine" ? " (refinement)" : ""}`);
       // We have enough info to recommend contacts
       console.log(`[Process] Fetching contacts from Slack`);
@@ -670,14 +742,15 @@ async function processUserMessage(
       );
     } else {
       console.log(`[Process] Entering clarification mode`);
-      // Need more clarification
-      const clarificationText = analysis.clarificationQuestions
-        .slice(0, 2) // Limit to 2 questions for brevity
-        .join("\n\n");
+      // Need more clarification — do NOT inject hard-coded questions; use only model questions
+      const clarificationText = analysis.clarificationQuestions.slice(0, 2).join("\n\n");
 
-      botResponse =
-        clarificationText ||
-        "Can you tell me more about what you need help with?";
+      // Avoid sending a hard-coded question; if model produced nothing, send a neutral status line.
+      botResponse = clarificationText || "I need more details to make a recommendation.";
+
+      // Show command buttons including a 'Recommend anyway' action so user can bypass clarification.
+      showCommandButtons = true;
+      includeRecommendButton = true;
 
       console.log(`[Process] Clarification questions: ${analysis.clarificationQuestions.length}`);
       // Update conversation with clarification state
@@ -706,7 +779,7 @@ async function processUserMessage(
 
     console.log(`[Process] Sending response to Slack (length: ${botResponse.length})`);
     // Send response to user
-    await postDmReply(workspaceId, channelId, botResponse, showCommandButtons);
+    await postDmReply(workspaceId, channelId, botResponse, showCommandButtons, includeRecommendButton);
     console.log(`[Process] Completed successfully for user ${userId}`);
   } catch (error) {
     console.error("[Process] Error processing message:", error);

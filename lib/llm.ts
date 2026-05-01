@@ -504,7 +504,8 @@ OPTIONAL fields:
 Rules:
 - Only include REQUIRED fields in missingFields.
 - Do not ask clarifying questions about OPTIONAL fields unless the user explicitly asks for that depth.
-- Ask at most 2 clarification questions.
+- Ask no more than 2 concise, high-signal clarification questions. If no clarification is needed, return an empty array for "clarificationQuestions".
+- Each clarification question should be one clear sentence, avoid generic low-value prompts like "What do you mean?" or "Can you tell me more?".
 - If the user is giving feedback on previous recommendations, set nextAction to "refine" and populate refinement.
 - If the user asks to start over, set nextAction to "reset".
 - If required fields are reasonably inferred, return confidence >= 0.7.
@@ -540,7 +541,8 @@ Respond with ONLY valid JSON, no markdown or extra text:
     { role: "user", content: userMessage },
   ];
 
-  const response = await callLLM(messages, 0.5);
+  // Lower temperature to reduce unnecessary questioning and be more deterministic
+  const response = await callLLM(messages, 0.35);
 
   try {
     // Extract JSON from response (handle potential markdown wrapping)
@@ -579,7 +581,25 @@ Respond with ONLY valid JSON, no markdown or extra text:
       return typeof value !== "string" || value.trim().length === 0;
     });
 
-    const clarificationQuestions = normalizeStringArray(parsed.clarificationQuestions).slice(0, 2);
+    // Sanitize clarification questions: unique, concise, filter low-value ones, cap at 2
+    const rawQuestions = normalizeStringArray(parsed.clarificationQuestions);
+    const genericQuestionPatterns = [
+      /what do you mean\??$/i,
+      /can you tell me more\??$/i,
+      /can you explain\??$/i,
+      /please clarify\.?$/i,
+      /^more details\??$/i,
+    ];
+
+    const cleaned = rawQuestions
+      .map((q) => q.trim())
+      .filter(Boolean)
+      .filter((q, idx, arr) => arr.findIndex((x) => x.toLowerCase() === q.toLowerCase()) === idx)
+      .filter((q) => q.length > 6) // remove extremely short/empty prompts
+      .filter((q) => !genericQuestionPatterns.some((pat) => pat.test(q)))
+      .slice(0, 2);
+
+    const clarificationQuestions = cleaned;
 
     const confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0.5;
     const parsedNextAction = typeof parsed.nextAction === "string" ? parsed.nextAction : undefined;
@@ -632,11 +652,11 @@ Respond with ONLY valid JSON, no markdown or extra text:
     const hasEnoughContext = /\b(help|need|need help|looking for|who should|recommend|find|backend|frontend|design|ml|data)\b/i.test(
       userMessage
     );
-    // Fallback
+    // Fallback (do not inject hard-coded clarification questions)
     return {
       updatedState: { summary: userMessage, keyNeeds: fallbackSignals.preferredDirections },
       missingFields: hasEnoughContext ? ["problemType"] : ["problemType", "keyNeeds"],
-      clarificationQuestions: ["What kind of help do you need, and what should I optimize for?"],
+      clarificationQuestions: [],
       confidence: hasEnoughContext ? 0.55 : 0.3,
       nextAction: hasEnoughContext ? "refine" : "clarify",
       refinement: fallbackSignals,
